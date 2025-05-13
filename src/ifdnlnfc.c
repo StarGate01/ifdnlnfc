@@ -1008,8 +1008,6 @@ IFDHTransmitToICC(DWORD Lun, SCARD_IO_HEADER SendPci, PUCHAR TxBuffer, DWORD
 	if (SendPci.Protocol != 1)
 		return IFD_NOT_SUPPORTED;
 
-	LogXxd(PCSC_LOG_DEBUG, "Writing to card: ", TxBuffer, TxLength);
-
 	bytes_written = write(ifdnlnfc_state.socket, TxBuffer, TxLength);
 	if (bytes_written != TxLength) {
 		Log3(PCSC_LOG_DEBUG, "Wrote %d bytes instead of %ld", bytes_written, TxLength);
@@ -1033,7 +1031,6 @@ IFDHTransmitToICC(DWORD Lun, SCARD_IO_HEADER SendPci, PUCHAR TxBuffer, DWORD
 
 	bytes_read--;
 
-	LogXxd(PCSC_LOG_DEBUG, "Reading from card: ", RxBuffer, bytes_read);
 	*RxLength = bytes_read;
 	RecvPci->Protocol = 1;
 
