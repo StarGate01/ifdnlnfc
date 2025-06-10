@@ -26,6 +26,11 @@
 #include <ifdhandler.h>
 #include <inttypes.h>
 
+// constants from the USB CCID IFD Handler by Ludovic Rousseau
+// for consistency
+#define CLASS2_IOCTL_MAGIC 0x330000
+#define IOCTL_FEATURE_GET_TLV_PROPERTIES SCARD_CTL_CODE(FEATURE_GET_TLV_PROPERTIES + CLASS2_IOCTL_MAGIC)
+
 static struct nl_sock *cmd_sock, *event_sock;
 static int nfc_family_id;
 

@@ -40,6 +40,7 @@
 #include <netlink/netlink.h>
 #include <poll.h>
 #include <pthread.h>
+#include <reader.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -1068,5 +1069,30 @@ RESPONSECODE
 IFDHControl(DWORD Lun, DWORD dwControlCode, PUCHAR TxBuffer, DWORD TxLength,
 	PUCHAR RxBuffer, DWORD RxLength, LPDWORD pdwBytesReturned)
 {
+	*pdwBytesReturned = 0;
+
+	if (dwControlCode == CM_IOCTL_GET_FEATURE_REQUEST)
+	{
+		PCSC_TLV_STRUCTURE *pcsc_tlv = (PCSC_TLV_STRUCTURE *)RxBuffer;
+		pcsc_tlv->tag = FEATURE_GET_TLV_PROPERTIES;
+		pcsc_tlv->length = 4;
+		pcsc_tlv->value = htonl(IOCTL_FEATURE_GET_TLV_PROPERTIES);
+		*pdwBytesReturned = sizeof(PCSC_TLV_STRUCTURE);
+		return IFD_SUCCESS;
+	}
+
+	if (dwControlCode == IOCTL_FEATURE_GET_TLV_PROPERTIES)
+	{
+		int p = 0;
+		RxBuffer[p++] = PCSCv2_PART10_PROPERTY_dwMaxAPDUDataSize;
+		RxBuffer[p++] = 4;	/* length */
+		RxBuffer[p++] = 0xff;
+		RxBuffer[p++] = 0xff;
+		RxBuffer[p++] = 0;
+		RxBuffer[p++] = 0;
+		*pdwBytesReturned = p;
+		return IFD_SUCCESS;
+	}
+
 	return IFD_ERROR_NOT_SUPPORTED;
 }
