@@ -44,6 +44,54 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
+/* NXP NPC300 (NXP1001) requires these proprietary CORE_SET_CONFIG payloads after
+ * CORE_INIT to stabilize the RF connection. */
+#define NXP_NCI_VENDOR_OUI				0x006037  /* NXP Semiconductors */
+#define NXP_NCI_SUBCMD_CORE_SET_CONFIG	0
+#define NXP_NCI_SUBCMD_PROP_CMD			1
+
+#define NXP_NCI_OID_PROPRIETARY_ACT		0x02
+#define NXP_NCI_OID_SET_POWER_MODE   	0x00
+
+#define NXP_NCI_PARAM_PMU_CFG						0xA0, 0x0E
+#define NXP_NCI_PARAM_DH_EEPROM_AREA_1				0xA0, 0x0F
+#define NXP_NCI_PARAM_TAG_DETECTOR_CFG				0xA0, 0x40
+#define NXP_NCI_PARAM_TAG_DETECTOR_FALLBACK_CNT_CFG	0xA0, 0x43
+#define NXP_NCI_PARAM_JEWEL_RID_CFG					0xA0, 0x5E
+
+#define NXP_NCI_PMU_VBAT1_5V           0x16
+#define NXP_NCI_PMU_TVDD_3V6_TXLDO_3V3 0x09
+#define NXP_NCI_PMU_RFU                0x00
+
+#define NXP_NCI_TLV(id, ...) \
+	id, (uint8_t)(sizeof((uint8_t[]){__VA_ARGS__})), __VA_ARGS__
+
+static const uint8_t nxp_nci_tvdd_cfg[] = {
+	1,
+	NXP_NCI_TLV(NXP_NCI_PARAM_PMU_CFG,
+	            NXP_NCI_PMU_VBAT1_5V, NXP_NCI_PMU_TVDD_3V6_TXLDO_3V3, NXP_NCI_PMU_RFU),
+};
+
+static const uint8_t nxp_nci_act_prop_extn[] = {
+	NXP_NCI_OID_PROPRIETARY_ACT
+};
+
+static const uint8_t nxp_nci_core_standby[] = {
+	NXP_NCI_OID_SET_POWER_MODE, 1
+};
+
+static const uint8_t nxp_nci_core_ext_cfg[] = {
+	4,
+	NXP_NCI_TLV(NXP_NCI_PARAM_JEWEL_RID_CFG, 1),
+	NXP_NCI_TLV(NXP_NCI_PARAM_TAG_DETECTOR_CFG, 0),
+	NXP_NCI_TLV(NXP_NCI_PARAM_TAG_DETECTOR_FALLBACK_CNT_CFG, 0), 
+	NXP_NCI_TLV(NXP_NCI_PARAM_DH_EEPROM_AREA_1,
+	            0x00, 0x03, 0x1D, 0x01, 0x03, 0x00, 0x02, 0x00,
+	            0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+	            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00),
+};
+
 static struct nl_sock *cmd_sock, *event_sock;
 static int nfc_family_id;
 static struct ifdnlnfc_state ifdnlnfc_state = {};
@@ -107,6 +155,70 @@ static int nl_send_msg(struct nl_sock *sock, struct nl_msg *msg,
 	return err;
 }
 
+
+static int nl_vendor_set_config(struct nfc_adapter *adapter,
+				const uint8_t *data, size_t data_len)
+{
+	struct nl_msg *msg;
+	void *hdr;
+	int err;
+
+	msg = nlmsg_alloc();
+	if (!msg)
+		return -ENOMEM;
+
+	hdr = genlmsg_put(msg, NL_AUTO_PID, NL_AUTO_SEQ, nfc_family_id, 0,
+			NLM_F_REQUEST, NFC_CMD_VENDOR, NFC_GENL_VERSION);
+	if (!hdr) {
+		err = -EINVAL;
+		goto nla_put_failure;
+	}
+
+	err = -EMSGSIZE;
+
+	NLA_PUT_U32(msg, NFC_ATTR_DEVICE_INDEX, adapter->idx);
+	NLA_PUT_U32(msg, NFC_ATTR_VENDOR_ID, NXP_NCI_VENDOR_OUI);
+	NLA_PUT_U32(msg, NFC_ATTR_VENDOR_SUBCMD, NXP_NCI_SUBCMD_CORE_SET_CONFIG);
+	NLA_PUT(msg, NFC_ATTR_VENDOR_DATA, data_len, data);
+
+	err = nl_send_msg(cmd_sock, msg, NULL, NULL);
+
+nla_put_failure:
+	nlmsg_free(msg);
+	return err;
+}
+
+static int nl_vendor_prop_cmd(struct nfc_adapter *adapter,
+			      const uint8_t *data, size_t data_len)
+{
+	struct nl_msg *msg;
+	void *hdr;
+	int err;
+
+	msg = nlmsg_alloc();
+	if (!msg)
+		return -ENOMEM;
+
+	hdr = genlmsg_put(msg, NL_AUTO_PID, NL_AUTO_SEQ, nfc_family_id, 0,
+			NLM_F_REQUEST, NFC_CMD_VENDOR, NFC_GENL_VERSION);
+	if (!hdr) {
+		err = -EINVAL;
+		goto nla_put_failure;
+	}
+
+	err = -EMSGSIZE;
+
+	NLA_PUT_U32(msg, NFC_ATTR_DEVICE_INDEX, adapter->idx);
+	NLA_PUT_U32(msg, NFC_ATTR_VENDOR_ID, NXP_NCI_VENDOR_OUI);
+	NLA_PUT_U32(msg, NFC_ATTR_VENDOR_SUBCMD, NXP_NCI_SUBCMD_PROP_CMD);
+	NLA_PUT(msg, NFC_ATTR_VENDOR_DATA, data_len, data);
+
+	err = nl_send_msg(cmd_sock, msg, NULL, NULL);
+
+nla_put_failure:
+	nlmsg_free(msg);
+	return err;
+}
 
 static int nl_set_powered(struct nfc_adapter * adapter, int powered)
 {
@@ -781,15 +893,35 @@ static int connect_target(struct nfc_adapter *adapter, struct nfc_target *target
 
 static int initialize_adapter(struct nfc_adapter *adapter)
 {
+	int err;
+
+	if (adapter->initial_power) {
+		/* Clear any poll left running by a previous session; the kernel
+		 * returns -EBUSY from DEV_DOWN if dev->polling is still set. */
+		adapter->poll_active = 1;
+		stop_poll_for_targets(adapter);
+		adapter->poll_active = 0;
+	}
+
 	if (adapter->initial_mode == NFC_RF_TARGET ||
 		(adapter->initial_power && nl_set_powered(adapter, 0))) {
 		Log1(PCSC_LOG_ERROR, "Adapter busy");
 		return -1;
 	}
 
-	if (!nl_set_powered(adapter, 1) && poll_for_targets(adapter)) {
+	err = nl_set_powered(adapter, 1);
+	if (err)
 		return -1;
-	}
+
+	if (nl_vendor_prop_cmd(adapter, nxp_nci_act_prop_extn, sizeof(nxp_nci_act_prop_extn)) ||
+	    nl_vendor_set_config(adapter, nxp_nci_tvdd_cfg, sizeof(nxp_nci_tvdd_cfg)) ||
+	    nl_vendor_set_config(adapter, nxp_nci_core_ext_cfg, sizeof(nxp_nci_core_ext_cfg)) ||
+	    nl_vendor_prop_cmd(adapter, nxp_nci_core_standby, sizeof(nxp_nci_core_standby)))
+		Log1(PCSC_LOG_INFO, "NXP NCI vendor config not applied (kernel driver may not support it).");
+
+	if (poll_for_targets(adapter))
+		return -1;
+
 	return 0;
 }
 
@@ -861,17 +993,41 @@ static RESPONSECODE IFDHPolling(DWORD Lun, int timeout)
 	struct pollfd fd = {nl_socket_get_fd(event_sock), POLLIN, 0};
 	Log4(PCSC_LOG_DEBUG, "card present: %d, poll active: %d, timeout: %d", ifdnlnfc_state.card_present, ifdnlnfc_state.adapter.poll_active, timeout);
 
-	if (ifdnlnfc_state.card_present && !clock_gettime(CLOCK_REALTIME, &deadline)) {
-		deadline.tv_nsec += (timeout % 1000) * 1000000;
-		deadline.tv_sec += timeout / 1000;
-		if (deadline.tv_nsec > 999999999) {
-			deadline.tv_nsec -= 1000000000;
-			deadline.tv_sec += 1;
+	if (ifdnlnfc_state.card_present) {
+		if (ifdnlnfc_state.socket && !clock_gettime(CLOCK_REALTIME, &deadline)) {
+			/* Connected: wait for target_lost signal */
+			deadline.tv_nsec += (timeout % 1000) * 1000000;
+			deadline.tv_sec += timeout / 1000;
+			if (deadline.tv_nsec > 999999999) {
+				deadline.tv_nsec -= 1000000000;
+				deadline.tv_sec += 1;
+			}
+			pthread_mutex_lock(&polling_lock);
+			if (!pthread_cond_timedwait(&target_lost, &polling_lock, &deadline))
+				Log1(PCSC_LOG_DEBUG, "Target gone, polling thread woken up.");
+			pthread_mutex_unlock(&polling_lock);
+		} else if (!ifdnlnfc_state.socket) {
+			/* Powered down: NCI auto-restarted RF discovery on socket close.
+			 * Drain any pending NFC_EVENT_TARGETS_FOUND with a short timeout;
+			 * after that NCI parks in W4_HOST_SELECT — no further events arrive.
+			 * Actively probe presence by connecting briefly: failure means removal. */
+			int probe_ms = timeout > 3000 ? 3000 : timeout;
+			if (poll(&fd, 1, probe_ms) > 0) {
+				nl_recvmsgs_default(event_sock);
+				if (ifdnlnfc_state.card_present && !ifdnlnfc_state.adapter.poll_active)
+					list_targets(&ifdnlnfc_state.adapter, &ifdnlnfc_state.target);
+			}
+			if (ifdnlnfc_state.card_present) {
+				if (connect_target(&ifdnlnfc_state.adapter, &ifdnlnfc_state.target) == 0) {
+					/* Card still present; disconnect so NCI restarts discovery. */
+					close(ifdnlnfc_state.socket);
+					ifdnlnfc_state.socket = 0;
+				} else {
+					Log1(PCSC_LOG_DEBUG, "Powered-down probe failed, target removed.");
+					remove_target();
+				}
+			}
 		}
-		pthread_mutex_lock(&polling_lock);
-		if (!pthread_cond_timedwait(&target_lost, &polling_lock, &deadline))
-			Log1(PCSC_LOG_DEBUG, "Target gone, polling thread woken up.");
-		pthread_mutex_unlock(&polling_lock);
 		return IFD_SUCCESS;
 	}
 	else if (poll(&fd, 1, timeout) != -1)
@@ -984,7 +1140,14 @@ IFDHPowerICC(DWORD Lun, DWORD Action, PUCHAR Atr, PDWORD AtrLength)
 	case IFD_POWER_DOWN:
 		Log1(PCSC_LOG_DEBUG, "IFD_POWER_DOWN");
 		*AtrLength = 0;
-		remove_target();
+		if (ifdnlnfc_state.socket) {
+			close(ifdnlnfc_state.socket);
+			ifdnlnfc_state.socket = 0;
+		}
+		/* Keep card_present set: the NFC card is still physically in the field.
+		 * NCI auto-restarts RF discovery (deactivation type DISCOVERY) on socket
+		 * close, so IFDHPolling will see NFC_EVENT_TARGETS_FOUND and refresh the
+		 * target idx before the next IFD_POWER_UP. */
 		return IFD_SUCCESS;
 	default:
 		;
