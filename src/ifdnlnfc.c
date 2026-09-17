@@ -910,7 +910,14 @@ failure:
 static int connect_target(struct nfc_adapter *adapter, struct nfc_target *target)
 {
 	int err;
+	int fd;
 	uint32_t protocol = 0;
+	struct sockaddr_nfc sa;
+
+	if (!ifdnlnfc_state.target_valid)
+		return -ENOENT;
+	if (ifdnlnfc_state.socket >= 0)
+		return -EISCONN;
 
 	if (target->supported_protocols & NFC_PROTO_ISO14443_MASK)
 		protocol = NFC_PROTO_ISO14443;
@@ -921,24 +928,46 @@ static int connect_target(struct nfc_adapter *adapter, struct nfc_target *target
 		return -1;
 	}
 
-	struct sockaddr_nfc sa = {PF_NFC, adapter->idx, target->idx, protocol};
+	sa = (struct sockaddr_nfc){PF_NFC, adapter->idx, target->idx, protocol};
 
-	int fd = socket(AF_NFC, SOCK_SEQPACKET, NFC_SOCKPROTO_RAW);
+	fd = socket(AF_NFC, SOCK_SEQPACKET, NFC_SOCKPROTO_RAW);
 	if (fd == -1)
-		return -1;
+		return -errno;
 
-	err = connect(fd, (struct sockaddr *) &sa, sizeof(sa));
-	if (!err) {
+	if (!connect(fd, (struct sockaddr *) &sa, sizeof(sa))) {
 		ifdnlnfc_state.socket = fd;
 		target->active_protocol = protocol;
 		Log3(PCSC_LOG_DEBUG, "Connected to NFC target. Index: %d, Protocol: %0x.", target->idx, protocol);
-		if (protocol == NFC_PROTO_ISO14443) get_target_ats(adapter, target);
-	}
-	else {
-		close(fd);
+		if (protocol == NFC_PROTO_ISO14443) {
+			set_atr_from_hb(target, NULL, 0);
+			get_target_ats(adapter, target);
+		}
+		return 0;
 	}
 
+	err = -errno;
+	close(fd);
 	return err;
+}
+
+static int reactivate_current_target(void)
+{
+	int err;
+
+	if (!ifdnlnfc_state.target_valid || ifdnlnfc_state.socket < 0)
+		return -ENOTCONN;
+
+	err = nl_reactivate_target(ifdnlnfc_state.adapter.idx,
+		ifdnlnfc_state.target.idx, ifdnlnfc_state.target.active_protocol);
+	if (err)
+		return err;
+
+	if (ifdnlnfc_state.target.active_protocol == NFC_PROTO_ISO14443) {
+		set_atr_from_hb(&ifdnlnfc_state.target, NULL, 0);
+		get_target_ats(&ifdnlnfc_state.adapter, &ifdnlnfc_state.target);
+	}
+
+	return 0;
 }
 
 static int initialize_adapter(struct nfc_adapter *adapter)
@@ -1198,61 +1227,94 @@ IFDHSetProtocolParameters(DWORD Lun, DWORD Protocol, UCHAR Flags, UCHAR PTS1,
 	return IFD_SUCCESS;
 }
 
+static RESPONSECODE copy_atr(PUCHAR atr, PDWORD atr_length)
+{
+	DWORD required = ifdnlnfc_state.target.atr_len;
+
+	if (!atr_length || (required && !atr))
+		return IFD_COMMUNICATION_ERROR;
+
+	if (*atr_length < required) {
+		*atr_length = required;
+		return IFD_ERROR_INSUFFICIENT_BUFFER;
+	}
+
+	*atr_length = required;
+	if (required)
+		memcpy(atr, ifdnlnfc_state.target.atr, required);
+
+	return IFD_SUCCESS;
+}
+
 RESPONSECODE
 IFDHPowerICC(DWORD Lun, DWORD Action, PUCHAR Atr, PDWORD AtrLength)
 {
-	int err = 0;
+	int err;
 	RESPONSECODE result;
 
 	(void)Lun;
 
 	pthread_mutex_lock(&state_lock);
 
+	if (!ifdnlnfc_state.channel_open) {
+		result = IFD_COMMUNICATION_ERROR;
+		goto out;
+	}
+
 	switch (Action) {
 
 	case IFD_RESET:
-		Log1(PCSC_LOG_DEBUG, "IFD_RESET");
-		if (ifdnlnfc_state.socket >= 0) {
-			if (!nl_reactivate_target(ifdnlnfc_state.adapter.idx, ifdnlnfc_state.target.idx, ifdnlnfc_state.target.active_protocol) && *AtrLength >= ifdnlnfc_state.target.atr_len) {
-				*AtrLength = ifdnlnfc_state.target.atr_len;
-				memcpy(Atr, &ifdnlnfc_state.target.atr, *AtrLength);
-				result = IFD_SUCCESS;
-				goto out;
-			}
-			else {
-				*AtrLength = 0;
-				result = IFD_ERROR_POWER_ACTION;
-				goto out;
-			}
-		}
-		//break;
-		Log1(PCSC_LOG_DEBUG, "falling through");
-
 	case IFD_POWER_UP:
-		Log1(PCSC_LOG_DEBUG, "IFD_POWER_UP");
-		err = connect_target(&ifdnlnfc_state.adapter, &ifdnlnfc_state.target);
-		if (err || *AtrLength < ifdnlnfc_state.target.atr_len) {
-			ifdnlnfc_state.card_present = 0;
+		Log1(PCSC_LOG_DEBUG, Action == IFD_RESET ? "IFD_RESET" : "IFD_POWER_UP");
+
+		if (!ifdnlnfc_state.card_present || !ifdnlnfc_state.target_valid) {
 			result = IFD_ERROR_POWER_ACTION;
 			goto out;
 		}
-		else {
-			*AtrLength = ifdnlnfc_state.target.atr_len;
-			memcpy(Atr, &ifdnlnfc_state.target.atr, *AtrLength);
-			result = IFD_SUCCESS;
+
+		if (ifdnlnfc_state.socket >= 0)
+			/* Already connected (kept alive across a prior
+			 * IFD_POWER_DOWN): bring the target back to ACTIVE
+			 * state rather than reconnecting from scratch. */
+			err = reactivate_current_target();
+		else
+			err = connect_target(&ifdnlnfc_state.adapter, &ifdnlnfc_state.target);
+
+		if (err) {
+			Log2(PCSC_LOG_DEBUG, "Unable to activate NFC target: %d", err);
+			remove_target();
+			if (AtrLength)
+				*AtrLength = 0;
+			result = IFD_ERROR_POWER_ACTION;
 			goto out;
 		}
 
+		result = copy_atr(Atr, AtrLength);
+		atomic_store_explicit(&ifdnlnfc_state.card_powered,
+			result == IFD_SUCCESS, memory_order_relaxed);
+		if (result != IFD_SUCCESS)
+			wake_polling_thread();
+		goto out;
+
 	case IFD_POWER_DOWN:
 		Log1(PCSC_LOG_DEBUG, "IFD_POWER_DOWN");
-		*AtrLength = 0;
-		remove_target();
+		if (AtrLength)
+			*AtrLength = 0;
+
+		/* Keep the raw socket connected: the NFC card is still
+		 * physically in the field, and closing it would deactivate
+		 * the kernel target and force PC/SC's next power-up through
+		 * a fresh discovery cycle, churning the target index and
+		 * dropping any external chip configuration. IFDHICCPresence
+		 * reactivates the same target on demand instead. */
+		atomic_store_explicit(&ifdnlnfc_state.card_powered, 0, memory_order_relaxed);
+		wake_polling_thread();
 		result = IFD_SUCCESS;
 		goto out;
 	default:
-		;
+		result = IFD_NOT_SUPPORTED;
+		goto out;
 	}
-	result = IFD_NOT_SUPPORTED;
 
 out:
 	pthread_mutex_unlock(&state_lock);
@@ -1328,6 +1390,17 @@ out:
 	return result;
 }
 
+static int load_current_target(void)
+{
+	if (list_targets(&ifdnlnfc_state.adapter, &ifdnlnfc_state.target)) {
+		remove_target();
+		return -1;
+	}
+
+	ifdnlnfc_state.target_valid = 1;
+	return 0;
+}
+
 RESPONSECODE
 IFDHICCPresence(DWORD Lun)
 {
@@ -1343,26 +1416,47 @@ IFDHICCPresence(DWORD Lun)
 		goto out;
 	}
 
-	if (ifdnlnfc_state.card_present) {
-		result = IFD_SUCCESS;
+	if (ifdnlnfc_state.adapter_removed) {
+		result = IFD_NO_SUCH_DEVICE;
 		goto out;
 	}
 
-	if (!ifdnlnfc_state.adapter.poll_active) {
-		poll_for_targets(&ifdnlnfc_state.adapter);
-	}
-
-	err = nl_recvmsgs_default(event_sock);
-
-	if (!err && ifdnlnfc_state.card_present)
-	{
-		if (!list_targets(&ifdnlnfc_state.adapter, &ifdnlnfc_state.target)) {
+	if (ifdnlnfc_state.card_present) {
+		if (ifdnlnfc_state.socket >= 0 &&
+			!atomic_load_explicit(&ifdnlnfc_state.card_powered, memory_order_relaxed)) {
+			/* Logically powered down but kept connected: actively
+			 * re-probe presence via target reactivation, since no
+			 * kernel event reliably tells us if the tag left the
+			 * field while we were idle. */
+			err = reactivate_current_target();
+			if (err) {
+				Log2(PCSC_LOG_DEBUG, "NFC presence probe failed: %d", err);
+				remove_target();
+			}
+			else {
+				result = IFD_SUCCESS;
+				goto out;
+			}
+		}
+		else {
 			result = IFD_SUCCESS;
 			goto out;
 		}
+	}
 
-		ifdnlnfc_state.card_present = 0;
-		result = IFD_COMMUNICATION_ERROR;
+	if (!ifdnlnfc_state.adapter.poll_active)
+		poll_for_targets(&ifdnlnfc_state.adapter);
+
+	err = nl_recvmsgs_default(event_sock);
+
+	if (ifdnlnfc_state.adapter_removed) {
+		result = IFD_NO_SUCH_DEVICE;
+		goto out;
+	}
+
+	if (!err && ifdnlnfc_state.card_present)
+	{
+		result = load_current_target() ? IFD_COMMUNICATION_ERROR : IFD_SUCCESS;
 		goto out;
 	}
 	result = IFD_ICC_NOT_PRESENT;
