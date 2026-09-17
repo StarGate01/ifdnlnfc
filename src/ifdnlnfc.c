@@ -1529,6 +1529,14 @@ IFDHTransmitToICC(DWORD Lun, SCARD_IO_HEADER SendPci, PUCHAR TxBuffer, DWORD
 
 	(void)Lun;
 
+	/* Validate before dereferencing anything: RxBuffer in particular is
+	 * handed straight to readv(), where a NULL would fail with EFAULT and
+	 * be misread as "the target is gone", tearing down a card that is
+	 * actually still present. */
+	if (!RxLength || !RecvPci || (TxLength && !TxBuffer) ||
+		(*RxLength && !RxBuffer))
+		return IFD_COMMUNICATION_ERROR;
+
 	/* Held across raw_transceive() below, not just the state checks: the
 	 * socket fd must not be closed by a concurrent remove_target() (from
 	 * IFDHPolling/IFDHICCPresence on the polling thread) while a
