@@ -55,7 +55,7 @@
 
 /* While the PC/SC client has logically powered the card down, re-probe its
  * presence at least this often so removal is still noticed promptly. */
-#define PRESENCE_PROBE_INTERVAL_MS 3000
+#define PRESENCE_PROBE_INTERVAL_MS 1000
 
 static struct nl_sock *cmd_sock, *event_sock;
 static int nfc_family_id;
