@@ -99,14 +99,17 @@ static int nl_send_msg(struct nl_sock *sock, struct nl_msg *msg,
 	if (rx_handler)
 		nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, rx_handler, data);
 
-	while (err == 0 && done == 0)
-		nl_recvmsgs(sock, cb);
+	while (err == 0 && done == 0) {
+		int recv_err = nl_recvmsgs(sock, cb);
+
+		if (recv_err < 0)
+			err = recv_err;
+	}
 
 	nl_cb_put(cb);
 
 	return err;
 }
-
 
 static int nl_set_powered(struct nfc_adapter * adapter, int powered)
 {
@@ -332,8 +335,8 @@ static int list_targets(struct nfc_adapter * adapter, struct nfc_target *result)
 	struct nl_msg *msg;
 	void *hdr;
 	int err = -1;
-
-	struct list_targets_cb_state state = {0, result};
+	struct nfc_target target = {0};
+	struct list_targets_cb_state state = {0, &target};
 
 	msg = nlmsg_alloc();
 	if (!msg)
@@ -348,10 +351,14 @@ static int list_targets(struct nfc_adapter * adapter, struct nfc_target *result)
 
 	NLA_PUT_U32(msg, NFC_ATTR_DEVICE_INDEX, adapter->idx);
 
-	if (!nl_send_msg(cmd_sock, msg, get_targets_handler, &state) && state.found) {
+	err = nl_send_msg(cmd_sock, msg, get_targets_handler, &state);
+	if (!err && state.found) {
+		*result = target;
 		nlmsg_free(msg);
 		return 0;
 	}
+	if (!err)
+		err = -ENOENT;
 
 nla_put_failure:
 	nlmsg_free(msg);
@@ -385,6 +392,8 @@ static int get_target_ats(struct nfc_adapter * adapter, struct nfc_target * targ
 		nlmsg_free(msg);
 		return 0;
 	}
+	if (!err)
+		err = -ENOENT;
 
 nla_put_failure:
 	nlmsg_free(msg);
@@ -455,21 +464,34 @@ static int family_handler(struct nl_msg *msg, void *arg)
 static int get_multicast_id(struct nl_sock *sock, int *group_id)
 {
 	struct nl_msg *msg;
+	void *hdr;
 	int err = -EINVAL;
 	int ctrlid;
+
+	*group_id = -1;
 
 	msg = nlmsg_alloc();
 	if (!msg)
 		return -ENOMEM;
 
 	ctrlid = genl_ctrl_resolve(sock, "nlctrl");
+	if (ctrlid < 0) {
+		err = ctrlid;
+		goto nla_put_failure;
+	}
 
-	genlmsg_put(msg, 0, 0, ctrlid, 0,
+	hdr = genlmsg_put(msg, 0, 0, ctrlid, 0,
 		0, CTRL_CMD_GETFAMILY, 0);
+	if (!hdr) {
+		err = -EINVAL;
+		goto nla_put_failure;
+	}
 
 	NLA_PUT_STRING(msg, CTRL_ATTR_FAMILY_NAME, NFC_GENL_NAME);
 
 	err = nl_send_msg(sock, msg, family_handler, group_id);
+	if (!err && *group_id < 0)
+		err = -ENOENT;
 
 nla_put_failure:
 	nlmsg_free(msg);
