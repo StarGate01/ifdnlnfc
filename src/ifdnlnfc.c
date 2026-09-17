@@ -554,6 +554,7 @@ static int poll_for_targets(struct nfc_adapter * adapter)
 	}
 
 nla_put_failure:
+	nlmsg_free(msg);
 	return err;
 }
 
@@ -590,6 +591,7 @@ static int stop_poll_for_targets(struct nfc_adapter * adapter)
 		Log2(PCSC_LOG_DEBUG, "NFC target poll stopped. Adapter index: %d.", adapter->idx);
 	}
 nla_put_failure:
+	nlmsg_free(msg);
 	return err;
 }
 
