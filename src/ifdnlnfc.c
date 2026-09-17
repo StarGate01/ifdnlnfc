@@ -1098,48 +1098,72 @@ out:
 	return result;
 }
 
+/* Closes a duplicated descriptor on cancellation -- see IFDHPolling(). */
+static void polling_close_fd_cleanup(void *arg)
+{
+	int *fd = arg;
+
+	if (*fd >= 0)
+		close(*fd);
+}
+
 static RESPONSECODE IFDHPolling(DWORD Lun, int timeout)
 {
 	struct pollfd fds[2];
 	uint64_t wake_count;
 	int effective_timeout = timeout;
 	int result;
-	int event_fd_dup, wake_fd_dup;
+	int event_fd_dup = -1, wake_fd_dup = -1;
+	int cancelstate;
+	int have_fds;
 
 	(void)Lun;
 
+	/* We advertise TAG_IFD_POLLING_THREAD_KILLABLE, so pcscd cancels this
+	 * thread rather than waiting for it to return. Cancellation is only
+	 * safe at the poll() below, so hold it off across the locked section:
+	 * Log4() can block in syslog(), itself a cancellation point, and being
+	 * cancelled there would leave state_lock held forever and deadlock the
+	 * IFDHCloseChannel() that follows. */
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancelstate);
+
 	pthread_mutex_lock(&state_lock);
 
-	if (!event_sock || polling_wake_fd < 0) {
-		pthread_mutex_unlock(&state_lock);
-		return IFD_COMMUNICATION_ERROR;
+	have_fds = event_sock && polling_wake_fd >= 0;
+
+	if (have_fds) {
+		Log4(PCSC_LOG_DEBUG, "card present: %d, poll active: %d, timeout: %d",
+			ifdnlnfc_state.card_present, ifdnlnfc_state.adapter.poll_active, timeout);
+
+		/* Duplicate the fds while still holding the lock, and
+		 * poll/read the duplicates instead of the originals below. A
+		 * concurrent IFDHCloseChannel() (called from a different pcscd
+		 * thread while we are blocked in poll()) tears down
+		 * event_sock/polling_wake_fd via netlink_cleanup(), which
+		 * would otherwise leave us polling (and, for the wake fd,
+		 * re-reading) closed -- and potentially reused -- file
+		 * descriptor numbers. dup() gives us our own reference to the
+		 * same underlying open file description, so it keeps working
+		 * correctly regardless of what happens to the originals. */
+		event_fd_dup = dup(nl_socket_get_fd(event_sock));
+		wake_fd_dup = dup(polling_wake_fd);
 	}
-
-	Log4(PCSC_LOG_DEBUG, "card present: %d, poll active: %d, timeout: %d",
-		ifdnlnfc_state.card_present, ifdnlnfc_state.adapter.poll_active, timeout);
-
-	/* Duplicate the fds while still holding the lock, and poll/read the
-	 * duplicates instead of the originals below. A concurrent
-	 * IFDHCloseChannel() (called from a different pcscd thread while we
-	 * are blocked in poll()) tears down event_sock/polling_wake_fd via
-	 * netlink_cleanup(), which would otherwise leave us polling (and,
-	 * for the wake fd, re-reading) closed -- and potentially reused --
-	 * file descriptor numbers. dup() gives us our own reference to the
-	 * same underlying open file description, so it keeps working
-	 * correctly regardless of what happens to the originals. */
-	event_fd_dup = dup(nl_socket_get_fd(event_sock));
-	wake_fd_dup = dup(polling_wake_fd);
 
 	/* Release the lock before the (potentially multi-second) blocking
 	 * wait below, so other IFDH* entry points are not stalled by it. */
 	pthread_mutex_unlock(&state_lock);
 
-	if (event_fd_dup < 0 || wake_fd_dup < 0) {
-		if (event_fd_dup >= 0)
-			close(event_fd_dup);
-		if (wake_fd_dup >= 0)
-			close(wake_fd_dup);
-		return IFD_COMMUNICATION_ERROR;
+	pthread_cleanup_push(polling_close_fd_cleanup, &event_fd_dup);
+	pthread_cleanup_push(polling_close_fd_cleanup, &wake_fd_dup);
+
+	/* Cancellable again from here: the only blocking call left is poll(),
+	 * and the handlers just pushed release the descriptors if we are
+	 * cancelled in it. */
+	pthread_setcancelstate(cancelstate, NULL);
+
+	if (!have_fds || event_fd_dup < 0 || wake_fd_dup < 0) {
+		result = IFD_COMMUNICATION_ERROR;
+		goto out;
 	}
 
 	fds[0] = (struct pollfd){event_fd_dup, POLLIN, 0};
@@ -1166,14 +1190,18 @@ static RESPONSECODE IFDHPolling(DWORD Lun, int timeout)
 		} while (read_result < 0 && errno == EINTR);
 	}
 
-	close(event_fd_dup);
-	close(wake_fd_dup);
-
 	if (result < 0 || (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) ||
 		(fds[1].revents & (POLLERR | POLLHUP | POLLNVAL)))
-		return IFD_COMMUNICATION_ERROR;
+		result = IFD_COMMUNICATION_ERROR;
+	else
+		result = IFD_SUCCESS;
 
-	return IFD_SUCCESS;
+out:
+	/* Both pops run their handler, closing the duplicated fds. */
+	pthread_cleanup_pop(1);
+	pthread_cleanup_pop(1);
+
+	return result;
 }
 
 RESPONSECODE
