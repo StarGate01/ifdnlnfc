@@ -1367,9 +1367,22 @@ out:
 /* Send tx_len bytes from tx and read back into rx (capacity rx_cap) over
  * the connected raw NFC target socket, storing the actual response length
  * in *rx_len. Caller must hold state_lock and have already verified the
- * socket is connected. On any I/O failure the target is dropped (the
- * kernel side gives no cleaner signal than a short write or an empty/
- * failed read that the target is gone) and -1 is returned. */
+ * socket is connected.
+ *
+ * Returns RAW_XCV_OK on success.
+ *
+ * RAW_XCV_IO_ERROR means the target is gone -- the kernel side gives no
+ * cleaner signal than a short write or an empty/failed read -- and the
+ * target has already been dropped by the time this returns.
+ *
+ * RAW_XCV_TRUNCATED means the card answered but its response did not fit
+ * in rx_cap. The target is still fine and is left connected; only the
+ * response is unusable, so callers that just need proof of life can treat
+ * this as success. */
+#define RAW_XCV_OK		0
+#define RAW_XCV_IO_ERROR	-1
+#define RAW_XCV_TRUNCATED	-2
+
 static int raw_transceive(const unsigned char *tx, size_t tx_len,
 		unsigned char *rx, size_t rx_cap, size_t *rx_len)
 {
@@ -1377,6 +1390,7 @@ static int raw_transceive(const unsigned char *tx, size_t tx_len,
 	ssize_t bytes_read;
 	unsigned char kernel_header;
 	struct iovec iov[] = {{&kernel_header, 1}, {rx, rx_cap}};
+	struct msghdr msg = {0};
 
 	do {
 		bytes_written = send(ifdnlnfc_state.socket, tx, tx_len, MSG_NOSIGNAL);
@@ -1385,28 +1399,44 @@ static int raw_transceive(const unsigned char *tx, size_t tx_len,
 	if (bytes_written < 0 || (size_t)bytes_written != tx_len) {
 		Log3(PCSC_LOG_DEBUG, "Wrote %ld bytes instead of %ld", (long)bytes_written, (long)tx_len);
 		remove_target();
-		return -1;
+		return RAW_XCV_IO_ERROR;
 	}
 
 	/* rawsock_data_exchange_complete()/rawsock_add_header() in the
 	 * kernel (net/nfc/rawsock.c) prepends one extra byte (always 0) to
 	 * every response before it is queued for us to read; strip it here
-	 * rather than leak it into the ICC response PC/SC clients see. */
+	 * rather than leak it into the ICC response PC/SC clients see.
+	 *
+	 * recvmsg() rather than readv() so MSG_TRUNC is visible: this is a
+	 * SOCK_SEQPACKET socket, so a response larger than rx_cap is silently
+	 * truncated to what fits and the rest discarded. Reporting that as a
+	 * complete, successful response would hand the PC/SC client a
+	 * truncated APDU it has no way to detect. */
+	msg.msg_iov = iov;
+	msg.msg_iovlen = 2;
+
 	do {
-		bytes_read = readv(ifdnlnfc_state.socket, iov, 2);
+		bytes_read = recvmsg(ifdnlnfc_state.socket, &msg, 0);
 	} while (bytes_read < 0 && errno == EINTR);
 
 	if (bytes_read == -1) {
-		Log2(PCSC_LOG_DEBUG, "readv() error, errno: %d", errno);
+		Log2(PCSC_LOG_DEBUG, "recvmsg() error, errno: %d", errno);
 	}
 
 	if (bytes_read < 1) {
 		remove_target();
-		return -1;
+		return RAW_XCV_IO_ERROR;
+	}
+
+	if (msg.msg_flags & MSG_TRUNC) {
+		Log2(PCSC_LOG_ERROR,
+			"Response too large for the receive buffer (%lu bytes)",
+			(unsigned long)rx_cap);
+		return RAW_XCV_TRUNCATED;
 	}
 
 	*rx_len = (size_t)(bytes_read - 1);
-	return 0;
+	return RAW_XCV_OK;
 }
 
 /* PC/SC Part 10 pseudo-APDU extensions used by German eID software (e.g.
@@ -1530,7 +1560,7 @@ IFDHTransmitToICC(DWORD Lun, SCARD_IO_HEADER SendPci, PUCHAR TxBuffer, DWORD
 	(void)Lun;
 
 	/* Validate before dereferencing anything: RxBuffer in particular is
-	 * handed straight to readv(), where a NULL would fail with EFAULT and
+	 * handed straight to recvmsg(), where a NULL would fail with EFAULT and
 	 * be misread as "the target is gone", tearing down a card that is
 	 * actually still present. */
 	if (!RxLength || !RecvPci || (TxLength && !TxBuffer) ||
@@ -1572,7 +1602,15 @@ IFDHTransmitToICC(DWORD Lun, SCARD_IO_HEADER SendPci, PUCHAR TxBuffer, DWORD
 		goto out;
 	}
 
-	if (raw_transceive(TxBuffer, TxLength, RxBuffer, *RxLength, &rx_len)) {
+	switch (raw_transceive(TxBuffer, TxLength, RxBuffer, *RxLength, &rx_len)) {
+	case RAW_XCV_OK:
+		break;
+	case RAW_XCV_TRUNCATED:
+		/* The card is still there, the client's buffer was too small. */
+		*RxLength = 0;
+		result = IFD_ERROR_INSUFFICIENT_BUFFER;
+		goto out;
+	default:
 		*RxLength = 0;
 		result = IFD_ICC_NOT_PRESENT;
 		goto out;
@@ -1645,7 +1683,11 @@ IFDHICCPresence(DWORD Lun)
 			 * could only ever end in -ETIMEDOUT -- making a tag
 			 * that never left the field look like it was being
 			 * removed and rediscovered every few seconds. */
-			if (!raw_transceive(NULL, 0, probe_rx, sizeof(probe_rx), &probe_rx_len)) {
+			/* Any answer proves the card is there, including one
+			 * too large for probe_rx -- only an I/O failure means
+			 * the target is actually gone. */
+			if (raw_transceive(NULL, 0, probe_rx, sizeof(probe_rx),
+					&probe_rx_len) != RAW_XCV_IO_ERROR) {
 				(void)probe_rx_len;
 				result = IFD_SUCCESS;
 				goto out;
