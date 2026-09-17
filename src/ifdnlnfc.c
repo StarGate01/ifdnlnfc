@@ -1038,75 +1038,75 @@ static int initialize_adapter(struct nfc_adapter *adapter)
 	return 0;
 }
 
-RESPONSECODE
-IFDHCreateChannelByName(DWORD Lun, LPSTR DeviceName)
+/* Common body of IFDHCreateChannel(ByName)(): reset driver state, stand up
+ * the netlink sockets, look up the adapter via find_adapter()/find_arg, and
+ * bring it up. Called with state_lock held. */
+static RESPONSECODE open_channel(int (*find_adapter)(void *arg, struct nfc_adapter *adapter),
+		void *find_arg)
 {
 	RESPONSECODE result = IFD_COMMUNICATION_ERROR;
 
-	(void)Lun;
-
-	pthread_mutex_lock(&state_lock);
-
-	if (ifdnlnfc_state.channel_open || !DeviceName)
-		goto out;
+	if (ifdnlnfc_state.channel_open)
+		return result;
 
 	reset_driver_state();
 
 	if (netlink_setup())
-		goto out;
+		return result;
 
-	if (get_adapter_by_name(DeviceName, &ifdnlnfc_state.adapter)) {
+	if (find_adapter(find_arg, &ifdnlnfc_state.adapter)) {
 		netlink_cleanup();
-		result = IFD_NO_SUCH_DEVICE;
-		goto out;
+		return IFD_NO_SUCH_DEVICE;
 	}
 
 	if (!initialize_adapter(&ifdnlnfc_state.adapter)) {
 		ifdnlnfc_state.channel_open = 1;
-		result = IFD_SUCCESS;
-		goto out;
+		return IFD_SUCCESS;
 	}
 
 	netlink_cleanup();
+	return result;
+}
 
-out:
+static int find_adapter_by_name(void *arg, struct nfc_adapter *adapter)
+{
+	return get_adapter_by_name((const char *)arg, adapter);
+}
+
+static int find_adapter_by_idx(void *arg, struct nfc_adapter *adapter)
+{
+	return get_adapter_by_idx(*(uint32_t *)arg, adapter);
+}
+
+RESPONSECODE
+IFDHCreateChannelByName(DWORD Lun, LPSTR DeviceName)
+{
+	RESPONSECODE result;
+
+	(void)Lun;
+
+	if (!DeviceName)
+		return IFD_COMMUNICATION_ERROR;
+
+	pthread_mutex_lock(&state_lock);
+	result = open_channel(find_adapter_by_name, DeviceName);
 	pthread_mutex_unlock(&state_lock);
+
 	return result;
 }
 
 RESPONSECODE
 IFDHCreateChannel(DWORD Lun, DWORD Channel)
 {
-	RESPONSECODE result = IFD_COMMUNICATION_ERROR;
+	RESPONSECODE result;
+	uint32_t idx = Channel;
 
 	(void)Lun;
 
 	pthread_mutex_lock(&state_lock);
-
-	if (ifdnlnfc_state.channel_open)
-		goto out;
-
-	reset_driver_state();
-
-	if (netlink_setup())
-		goto out;
-
-	if (get_adapter_by_idx(Channel, &ifdnlnfc_state.adapter)) {
-		netlink_cleanup();
-		result = IFD_NO_SUCH_DEVICE;
-		goto out;
-	}
-
-	if (!initialize_adapter(&ifdnlnfc_state.adapter)) {
-		ifdnlnfc_state.channel_open = 1;
-		result = IFD_SUCCESS;
-		goto out;
-	}
-
-	netlink_cleanup();
-
-out:
+	result = open_channel(find_adapter_by_idx, &idx);
 	pthread_mutex_unlock(&state_lock);
+
 	return result;
 }
 
