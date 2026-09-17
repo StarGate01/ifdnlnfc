@@ -47,6 +47,12 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
+/* Platform/vendor initialization (e.g. the NXP NPC300 proprietary
+ * CORE_SET_CONFIG payloads) is out of scope for this driver. It is applied
+ * once, out of band, by the npc300-init tool at boot and on resume; see
+ * README. This driver only ever reuses whatever power/RF state it finds the
+ * adapter in. */
+
 /* While the PC/SC client has logically powered the card down, re-probe its
  * presence at least this often so removal is still noticed promptly. */
 #define PRESENCE_PROBE_INTERVAL_MS 3000
@@ -734,10 +740,13 @@ static int stop_poll_for_targets(struct nfc_adapter * adapter)
 
 	err = nl_send_msg(cmd_sock, msg, NULL, NULL);
 
-	if (err)
+	/* -EINVAL means the kernel considers polling already inactive
+	 * (dev->polling was already clear); treat that as success. */
+	if (err && err != -EINVAL)
 		Log3(PCSC_LOG_ERROR, "Error %x stopping NFC target poll. Adapter index: %d.", err, adapter->idx);
 	else {
-		adapter->poll_active=0;
+		err = 0;
+		adapter->poll_active = 0;
 		Log2(PCSC_LOG_DEBUG, "NFC target poll stopped. Adapter index: %d.", adapter->idx);
 	}
 nla_put_failure:
@@ -882,7 +891,7 @@ static int netlink_setup(void)
 		goto failure;
 	}
 
-	nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, event_handler, &ifdnlnfc_state.card_present);
+	nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, event_handler, NULL);
 	nl_socket_set_cb(event_sock, cb);
 	nl_cb_put(cb);
 	nl_socket_disable_seq_check(event_sock);
@@ -972,15 +981,38 @@ static int reactivate_current_target(void)
 
 static int initialize_adapter(struct nfc_adapter *adapter)
 {
-	if (adapter->initial_mode == NFC_RF_TARGET ||
-		(adapter->initial_power && nl_set_powered(adapter, 0))) {
+	int err;
+
+	if (adapter->initial_mode == NFC_RF_TARGET) {
 		Log1(PCSC_LOG_ERROR, "Adapter busy");
 		return -1;
 	}
 
-	if (!nl_set_powered(adapter, 1) && poll_for_targets(adapter)) {
+	if (adapter->initial_power) {
+		/* The adapter is already up, presumably brought up and
+		 * proprietary-initialized by npc300-init at boot/resume.
+		 * Powering it down and back up here would discard that
+		 * (volatile) configuration, so only clear a poll left
+		 * running by an interrupted previous session. */
+		adapter->poll_active = 1;
+		err = stop_poll_for_targets(adapter);
+		adapter->poll_active = 0;
+		if (err)
+			return -1;
+	}
+	else {
+		err = nl_set_powered(adapter, 1);
+		if (err)
+			return -1;
+	}
+
+	err = poll_for_targets(adapter);
+	if (err) {
+		if (!adapter->initial_power)
+			nl_set_powered(adapter, 0);
 		return -1;
 	}
+
 	return 0;
 }
 
@@ -1068,6 +1100,8 @@ IFDHCloseChannel(DWORD Lun)
 	if (!ifdnlnfc_state.channel_open)
 		goto out;
 
+	ifdnlnfc_state.channel_open = 0;
+
 	close_target_socket();
 
 	stop_poll_for_targets(&ifdnlnfc_state.adapter);
@@ -1115,7 +1149,7 @@ static RESPONSECODE IFDHPolling(DWORD Lun, int timeout)
 	 * is no reliable kernel event for the tag leaving the field (most
 	 * NCI drivers, including nxp-nci, never implement check_presence /
 	 * emit NFC_EVENT_TARGET_LOST). Wake up periodically instead so
-	 * IFDHICCPresence can actively re-probe. */
+	 * IFDHICCPresence can actively re-probe via target reactivation. */
 	if (!atomic_load_explicit(&ifdnlnfc_state.card_powered, memory_order_relaxed) &&
 		(timeout < 0 || timeout > PRESENCE_PROBE_INTERVAL_MS))
 		effective_timeout = PRESENCE_PROBE_INTERVAL_MS;

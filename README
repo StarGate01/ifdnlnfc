@@ -29,3 +29,5 @@ Example /etc/reader.conf.d/libnlnfc:
 FRIENDLYNAME "Linux NFC Reader"
 LIBPATH /usr/local/lib/libnlnfc.so
 CHANNELID 0
+
+Chips needing proprietary initialization (e.g. the NXP NPC300/NXP1001) should be primed out of band before pcscd starts, e.g. with https://github.com/StarGate01/nlnfc-init.
