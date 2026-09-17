@@ -43,6 +43,7 @@
 #include <reader.h>
 #include <string.h>
 #include <sys/eventfd.h>
+#include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -57,10 +58,21 @@ static struct ifdnlnfc_state ifdnlnfc_state = {
 	.socket = -1,
 };
 
+/* Protects ifdnlnfc_state and the netlink globals above from races between
+ * pcscd's dedicated polling thread (IFDHPolling/IFDHICCPresence) and the
+ * per-client worker threads calling the other IFDH* entry points; pcscd
+ * does not itself serialize these against each other. Held across each
+ * entry point's body, but never across the blocking poll() inside
+ * IFDHPolling -- only around the state it reads/writes before and after
+ * waiting. */
+static pthread_mutex_t state_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static int nl_error_handler(struct sockaddr_nl *nla, struct nlmsgerr *err,
 			void *arg)
 {
 	int *ret = arg;
+
+	(void)nla;
 	*ret = err->error;
 	return NL_STOP;
 }
@@ -68,6 +80,8 @@ static int nl_error_handler(struct sockaddr_nl *nla, struct nlmsgerr *err,
 static int nl_finish_handler(struct nl_msg *msg, void *arg)
 {
 	int *ret = arg;
+
+	(void)msg;
 	*ret = 1;
 	return NL_SKIP;
 }
@@ -75,6 +89,8 @@ static int nl_finish_handler(struct nl_msg *msg, void *arg)
 static int nl_ack_handler(struct nl_msg *msg, void *arg)
 {
 	int *ret = arg;
+
+	(void)msg;
 	*ret = 1;
 	return NL_SKIP;
 }
@@ -936,48 +952,86 @@ static int initialize_adapter(struct nfc_adapter *adapter)
 RESPONSECODE
 IFDHCreateChannelByName(DWORD Lun, LPSTR DeviceName)
 {
-	if (ifdnlnfc_state.channel_open || !DeviceName || netlink_setup())
-		return IFD_COMMUNICATION_ERROR;
+	RESPONSECODE result = IFD_COMMUNICATION_ERROR;
+
+	(void)Lun;
+
+	pthread_mutex_lock(&state_lock);
+
+	if (ifdnlnfc_state.channel_open || !DeviceName)
+		goto out;
+
+	reset_driver_state();
+
+	if (netlink_setup())
+		goto out;
 
 	if (get_adapter_by_name(DeviceName, &ifdnlnfc_state.adapter)) {
 		netlink_cleanup();
-		return IFD_NO_SUCH_DEVICE;
+		result = IFD_NO_SUCH_DEVICE;
+		goto out;
 	}
 
 	if (!initialize_adapter(&ifdnlnfc_state.adapter)) {
 		ifdnlnfc_state.channel_open = 1;
-		return IFD_SUCCESS;
+		result = IFD_SUCCESS;
+		goto out;
 	}
 
 	netlink_cleanup();
-	return IFD_COMMUNICATION_ERROR;
+
+out:
+	pthread_mutex_unlock(&state_lock);
+	return result;
 }
 
 RESPONSECODE
 IFDHCreateChannel(DWORD Lun, DWORD Channel)
 {
-	if (ifdnlnfc_state.channel_open || netlink_setup())
-		return IFD_COMMUNICATION_ERROR;
+	RESPONSECODE result = IFD_COMMUNICATION_ERROR;
+
+	(void)Lun;
+
+	pthread_mutex_lock(&state_lock);
+
+	if (ifdnlnfc_state.channel_open)
+		goto out;
+
+	reset_driver_state();
+
+	if (netlink_setup())
+		goto out;
 
 	if (get_adapter_by_idx(Channel, &ifdnlnfc_state.adapter)) {
 		netlink_cleanup();
-		return IFD_NO_SUCH_DEVICE;
+		result = IFD_NO_SUCH_DEVICE;
+		goto out;
 	}
 
 	if (!initialize_adapter(&ifdnlnfc_state.adapter)) {
 		ifdnlnfc_state.channel_open = 1;
-		return IFD_SUCCESS;
+		result = IFD_SUCCESS;
+		goto out;
 	}
 
 	netlink_cleanup();
-	return IFD_COMMUNICATION_ERROR;
+
+out:
+	pthread_mutex_unlock(&state_lock);
+	return result;
 }
 
 RESPONSECODE
 IFDHCloseChannel(DWORD Lun)
 {
+	RESPONSECODE result = IFD_COMMUNICATION_ERROR;
+
+	(void)Lun;
+
+	pthread_mutex_lock(&state_lock);
+
 	if (!ifdnlnfc_state.channel_open)
-		return IFD_COMMUNICATION_ERROR;
+		goto out;
 
 	close_target_socket();
 
@@ -989,7 +1043,11 @@ IFDHCloseChannel(DWORD Lun)
 	netlink_cleanup();
 	reset_driver_state();
 
-	return IFD_SUCCESS;
+	result = IFD_SUCCESS;
+
+out:
+	pthread_mutex_unlock(&state_lock);
+	return result;
 }
 
 static RESPONSECODE IFDHPolling(DWORD Lun, int timeout)
@@ -999,14 +1057,24 @@ static RESPONSECODE IFDHPolling(DWORD Lun, int timeout)
 	int effective_timeout = timeout;
 	int result;
 
-	if (!event_sock || polling_wake_fd < 0)
+	(void)Lun;
+
+	pthread_mutex_lock(&state_lock);
+
+	if (!event_sock || polling_wake_fd < 0) {
+		pthread_mutex_unlock(&state_lock);
 		return IFD_COMMUNICATION_ERROR;
+	}
 
 	Log4(PCSC_LOG_DEBUG, "card present: %d, poll active: %d, timeout: %d",
 		ifdnlnfc_state.card_present, ifdnlnfc_state.adapter.poll_active, timeout);
 
 	fds[0] = (struct pollfd){nl_socket_get_fd(event_sock), POLLIN, 0};
 	fds[1] = (struct pollfd){polling_wake_fd, POLLIN, 0};
+
+	/* Release the lock before the (potentially multi-second) blocking
+	 * wait below, so other IFDH* entry points are not stalled by it. */
+	pthread_mutex_unlock(&state_lock);
 
 	/* While the ICC is not currently powered by the PC/SC client, there
 	 * is no reliable kernel event for the tag leaving the field (most
@@ -1017,14 +1085,19 @@ static RESPONSECODE IFDHPolling(DWORD Lun, int timeout)
 		(timeout < 0 || timeout > PRESENCE_PROBE_INTERVAL_MS))
 		effective_timeout = PRESENCE_PROBE_INTERVAL_MS;
 
-	result = poll(fds, 2, effective_timeout);
+	do {
+		result = poll(fds, 2, effective_timeout);
+	} while (result < 0 && errno == EINTR);
 
 	if (result < 0 || (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) ||
 		(fds[1].revents & (POLLERR | POLLHUP | POLLNVAL)))
 		return IFD_COMMUNICATION_ERROR;
 
-	if (fds[1].revents & POLLIN)
-		result = read(polling_wake_fd, &wake_count, sizeof(wake_count));
+	if (fds[1].revents & POLLIN) {
+		do {
+			result = read(polling_wake_fd, &wake_count, sizeof(wake_count));
+		} while (result < 0 && errno == EINTR);
+	}
 
 	return IFD_SUCCESS;
 }
@@ -1032,41 +1105,56 @@ static RESPONSECODE IFDHPolling(DWORD Lun, int timeout)
 RESPONSECODE
 IFDHGetCapabilities(DWORD Lun, DWORD Tag, PDWORD Length, PUCHAR Value)
 {
+	(void)Lun;
 
 	if (!Length || !Value)
 		return IFD_COMMUNICATION_ERROR;
-	if (*Length < 1)
-		return IFD_ERROR_INSUFFICIENT_BUFFER;
 
 	switch (Tag) {
 	case TAG_IFD_ATR:
 #ifdef SCARD_ATTR_ATR_STRING
 	case SCARD_ATTR_ATR_STRING:
 #endif
-		if (ifdnlnfc_state.socket < 0)
+		pthread_mutex_lock(&state_lock);
+		if (!ifdnlnfc_state.target_valid || ifdnlnfc_state.socket < 0) {
+			pthread_mutex_unlock(&state_lock);
 			return IFD_COMMUNICATION_ERROR;
-		if (*Length < ifdnlnfc_state.target.atr_len)
+		}
+		if (*Length < (DWORD)ifdnlnfc_state.target.atr_len) {
+			pthread_mutex_unlock(&state_lock);
 			return IFD_ERROR_INSUFFICIENT_BUFFER;
+		}
 		*Length = ifdnlnfc_state.target.atr_len;
 		memcpy(Value, &ifdnlnfc_state.target.atr, *Length);
+		pthread_mutex_unlock(&state_lock);
 		break;
 	case TAG_IFD_SIMULTANEOUS_ACCESS:
+		if (*Length < 1)
+			return IFD_ERROR_INSUFFICIENT_BUFFER;
 		*Value = 0;
 		*Length = 1;
 		break;
 	case TAG_IFD_THREAD_SAFE:
+		if (*Length < 1)
+			return IFD_ERROR_INSUFFICIENT_BUFFER;
 		*Value	= 0;
 		*Length = 1;
 		break;
 	case TAG_IFD_SLOTS_NUMBER:
+		if (*Length < 1)
+			return IFD_ERROR_INSUFFICIENT_BUFFER;
 		*Value	= 1;
 		*Length = 1;
 		break;
 	case TAG_IFD_POLLING_THREAD_WITH_TIMEOUT:
+		if (*Length < sizeof(void *))
+			return IFD_ERROR_INSUFFICIENT_BUFFER;
 		*Length = sizeof(void *);
 		*(void **)Value = IFDHPolling;
 		break;
 	case TAG_IFD_POLLING_THREAD_KILLABLE:
+		if (*Length < 1)
+			return IFD_ERROR_INSUFFICIENT_BUFFER;
 		*Length = 1;
 		*Value = 1;
 		break;
@@ -1080,6 +1168,11 @@ IFDHGetCapabilities(DWORD Lun, DWORD Tag, PDWORD Length, PUCHAR Value)
 RESPONSECODE
 IFDHSetCapabilities(DWORD Lun, DWORD Tag, DWORD Length, PUCHAR Value)
 {
+	(void)Lun;
+	(void)Tag;
+	(void)Length;
+	(void)Value;
+
 	return IFD_ERROR_VALUE_READ_ONLY;
 }
 
@@ -1087,6 +1180,12 @@ RESPONSECODE
 IFDHSetProtocolParameters(DWORD Lun, DWORD Protocol, UCHAR Flags, UCHAR PTS1,
 			UCHAR PTS2, UCHAR PTS3)
 {
+	(void)Lun;
+	(void)Flags;
+	(void)PTS1;
+	(void)PTS2;
+	(void)PTS3;
+
 	if (Protocol != SCARD_PROTOCOL_T1)
 		return IFD_PROTOCOL_NOT_SUPPORTED;
 
@@ -1097,6 +1196,11 @@ RESPONSECODE
 IFDHPowerICC(DWORD Lun, DWORD Action, PUCHAR Atr, PDWORD AtrLength)
 {
 	int err = 0;
+	RESPONSECODE result;
+
+	(void)Lun;
+
+	pthread_mutex_lock(&state_lock);
 
 	switch (Action) {
 
@@ -1106,11 +1210,13 @@ IFDHPowerICC(DWORD Lun, DWORD Action, PUCHAR Atr, PDWORD AtrLength)
 			if (!nl_reactivate_target(ifdnlnfc_state.adapter.idx, ifdnlnfc_state.target.idx, ifdnlnfc_state.target.active_protocol) && *AtrLength >= ifdnlnfc_state.target.atr_len) {
 				*AtrLength = ifdnlnfc_state.target.atr_len;
 				memcpy(Atr, &ifdnlnfc_state.target.atr, *AtrLength);
-				return IFD_SUCCESS;
+				result = IFD_SUCCESS;
+				goto out;
 			}
 			else {
 				*AtrLength = 0;
-				return IFD_ERROR_POWER_ACTION;
+				result = IFD_ERROR_POWER_ACTION;
+				goto out;
 			}
 		}
 		//break;
@@ -1121,52 +1227,76 @@ IFDHPowerICC(DWORD Lun, DWORD Action, PUCHAR Atr, PDWORD AtrLength)
 		err = connect_target(&ifdnlnfc_state.adapter, &ifdnlnfc_state.target);
 		if (err || *AtrLength < ifdnlnfc_state.target.atr_len) {
 			ifdnlnfc_state.card_present = 0;
-			return IFD_ERROR_POWER_ACTION;
+			result = IFD_ERROR_POWER_ACTION;
+			goto out;
 		}
 		else {
 			*AtrLength = ifdnlnfc_state.target.atr_len;
 			memcpy(Atr, &ifdnlnfc_state.target.atr, *AtrLength);
-			return IFD_SUCCESS;
+			result = IFD_SUCCESS;
+			goto out;
 		}
-		break;
 
 	case IFD_POWER_DOWN:
 		Log1(PCSC_LOG_DEBUG, "IFD_POWER_DOWN");
 		*AtrLength = 0;
 		remove_target();
-		return IFD_SUCCESS;
+		result = IFD_SUCCESS;
+		goto out;
 	default:
 		;
 	}
-	return IFD_NOT_SUPPORTED;
+	result = IFD_NOT_SUPPORTED;
+
+out:
+	pthread_mutex_unlock(&state_lock);
+	return result;
 }
 
 RESPONSECODE
 IFDHTransmitToICC(DWORD Lun, SCARD_IO_HEADER SendPci, PUCHAR TxBuffer, DWORD
 		TxLength, PUCHAR RxBuffer, PDWORD RxLength, PSCARD_IO_HEADER RecvPci)
 {
-
-	int bytes_read;
-	int bytes_written;
+	RESPONSECODE result;
+	ssize_t bytes_read;
+	ssize_t bytes_written;
 
 	unsigned char null_header;
 	struct iovec iov[] = {{&null_header, 1}, {RxBuffer, *RxLength}};
 
-	if (ifdnlnfc_state.socket < 0)
-		return IFD_COMMUNICATION_ERROR;
+	(void)Lun;
 
-	if (SendPci.Protocol != 1)
-		return IFD_NOT_SUPPORTED;
+	/* Held across send()/readv() below, not just the state checks: the
+	 * socket fd must not be closed by a concurrent remove_target() (from
+	 * IFDHPolling/IFDHICCPresence on the polling thread) while a
+	 * transceive using it is in flight. */
+	pthread_mutex_lock(&state_lock);
 
-	bytes_written = write(ifdnlnfc_state.socket, TxBuffer, TxLength);
-	if (bytes_written != TxLength) {
-		Log3(PCSC_LOG_DEBUG, "Wrote %d bytes instead of %ld", bytes_written, TxLength);
-		*RxLength = 0;
-		remove_target();
-		return IFD_ICC_NOT_PRESENT;
+	if (ifdnlnfc_state.socket < 0) {
+		result = IFD_COMMUNICATION_ERROR;
+		goto out;
 	}
 
-	bytes_read = readv(ifdnlnfc_state.socket, iov, 2);
+	if (SendPci.Protocol != SCARD_PROTOCOL_T1) {
+		result = IFD_NOT_SUPPORTED;
+		goto out;
+	}
+
+	do {
+		bytes_written = send(ifdnlnfc_state.socket, TxBuffer, TxLength, MSG_NOSIGNAL);
+	} while (bytes_written < 0 && errno == EINTR);
+
+	if (bytes_written < 0 || (DWORD)bytes_written != TxLength) {
+		Log3(PCSC_LOG_DEBUG, "Wrote %ld bytes instead of %ld", (long)bytes_written, (long)TxLength);
+		*RxLength = 0;
+		remove_target();
+		result = IFD_ICC_NOT_PRESENT;
+		goto out;
+	}
+
+	do {
+		bytes_read = readv(ifdnlnfc_state.socket, iov, 2);
+	} while (bytes_read < 0 && errno == EINTR);
 
 	if (bytes_read == -1) {
 		Log2(PCSC_LOG_DEBUG, "readv() error, errno: %d", errno);
@@ -1176,26 +1306,41 @@ IFDHTransmitToICC(DWORD Lun, SCARD_IO_HEADER SendPci, PUCHAR TxBuffer, DWORD
 	{
 		*RxLength = 0;
 		remove_target();
-		return IFD_ICC_NOT_PRESENT;
+		result = IFD_ICC_NOT_PRESENT;
+		goto out;
 	}
 
 	bytes_read--;
 
-	*RxLength = bytes_read;
-	RecvPci->Protocol = 1;
+	*RxLength = (DWORD)bytes_read;
+	RecvPci->Protocol = SCARD_PROTOCOL_T1;
 
-	return IFD_SUCCESS;
+	result = IFD_SUCCESS;
+
+out:
+	pthread_mutex_unlock(&state_lock);
+	return result;
 }
 
 RESPONSECODE
 IFDHICCPresence(DWORD Lun)
 {
+	RESPONSECODE result;
 	int err;
-	if (!ifdnlnfc_state.channel_open)
-		return IFD_COMMUNICATION_ERROR;
 
-	if (ifdnlnfc_state.card_present)
-		return IFD_SUCCESS;
+	(void)Lun;
+
+	pthread_mutex_lock(&state_lock);
+
+	if (!ifdnlnfc_state.channel_open) {
+		result = IFD_COMMUNICATION_ERROR;
+		goto out;
+	}
+
+	if (ifdnlnfc_state.card_present) {
+		result = IFD_SUCCESS;
+		goto out;
+	}
 
 	if (!ifdnlnfc_state.adapter.poll_active) {
 		poll_for_targets(&ifdnlnfc_state.adapter);
@@ -1205,24 +1350,42 @@ IFDHICCPresence(DWORD Lun)
 
 	if (!err && ifdnlnfc_state.card_present)
 	{
-		if (!list_targets(&ifdnlnfc_state.adapter, &ifdnlnfc_state.target))
-			return IFD_SUCCESS;
+		if (!list_targets(&ifdnlnfc_state.adapter, &ifdnlnfc_state.target)) {
+			result = IFD_SUCCESS;
+			goto out;
+		}
 
 		ifdnlnfc_state.card_present = 0;
-		return IFD_COMMUNICATION_ERROR;
+		result = IFD_COMMUNICATION_ERROR;
+		goto out;
 	}
-	return IFD_ICC_NOT_PRESENT;
+	result = IFD_ICC_NOT_PRESENT;
+
+out:
+	pthread_mutex_unlock(&state_lock);
+	return result;
 }
 
 RESPONSECODE
 IFDHControl(DWORD Lun, DWORD dwControlCode, PUCHAR TxBuffer, DWORD TxLength,
 	PUCHAR RxBuffer, DWORD RxLength, LPDWORD pdwBytesReturned)
 {
+	(void)Lun;
+	(void)TxBuffer;
+	(void)TxLength;
+
+	if (!pdwBytesReturned)
+		return IFD_COMMUNICATION_ERROR;
+
 	*pdwBytesReturned = 0;
 
 	if (dwControlCode == CM_IOCTL_GET_FEATURE_REQUEST)
 	{
 		PCSC_TLV_STRUCTURE *pcsc_tlv = (PCSC_TLV_STRUCTURE *)RxBuffer;
+
+		if (!RxBuffer || RxLength < sizeof(*pcsc_tlv))
+			return IFD_ERROR_INSUFFICIENT_BUFFER;
+
 		pcsc_tlv->tag = FEATURE_GET_TLV_PROPERTIES;
 		pcsc_tlv->length = 4;
 		pcsc_tlv->value = htonl(IOCTL_FEATURE_GET_TLV_PROPERTIES);
@@ -1233,6 +1396,10 @@ IFDHControl(DWORD Lun, DWORD dwControlCode, PUCHAR TxBuffer, DWORD TxLength,
 	if (dwControlCode == IOCTL_FEATURE_GET_TLV_PROPERTIES)
 	{
 		int p = 0;
+
+		if (!RxBuffer || RxLength < 6)
+			return IFD_ERROR_INSUFFICIENT_BUFFER;
+
 		RxBuffer[p++] = PCSCv2_PART10_PROPERTY_dwMaxAPDUDataSize;
 		RxBuffer[p++] = 4;	/* length */
 		RxBuffer[p++] = 0xff;
