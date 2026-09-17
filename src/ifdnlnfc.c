@@ -1354,20 +1354,61 @@ out:
 	return result;
 }
 
+/* Send tx_len bytes from tx and read back into rx (capacity rx_cap) over
+ * the connected raw NFC target socket, storing the actual response length
+ * in *rx_len. Caller must hold state_lock and have already verified the
+ * socket is connected. On any I/O failure the target is dropped (the
+ * kernel side gives no cleaner signal than a short write or an empty/
+ * failed read that the target is gone) and -1 is returned. */
+static int raw_transceive(const unsigned char *tx, size_t tx_len,
+		unsigned char *rx, size_t rx_cap, size_t *rx_len)
+{
+	ssize_t bytes_written;
+	ssize_t bytes_read;
+	unsigned char kernel_header;
+	struct iovec iov[] = {{&kernel_header, 1}, {rx, rx_cap}};
+
+	do {
+		bytes_written = send(ifdnlnfc_state.socket, tx, tx_len, MSG_NOSIGNAL);
+	} while (bytes_written < 0 && errno == EINTR);
+
+	if (bytes_written < 0 || (size_t)bytes_written != tx_len) {
+		Log3(PCSC_LOG_DEBUG, "Wrote %ld bytes instead of %ld", (long)bytes_written, (long)tx_len);
+		remove_target();
+		return -1;
+	}
+
+	/* rawsock_data_exchange_complete()/rawsock_add_header() in the
+	 * kernel (net/nfc/rawsock.c) prepends one extra byte (always 0) to
+	 * every response before it is queued for us to read; strip it here
+	 * rather than leak it into the ICC response PC/SC clients see. */
+	do {
+		bytes_read = readv(ifdnlnfc_state.socket, iov, 2);
+	} while (bytes_read < 0 && errno == EINTR);
+
+	if (bytes_read == -1) {
+		Log2(PCSC_LOG_DEBUG, "readv() error, errno: %d", errno);
+	}
+
+	if (bytes_read < 1) {
+		remove_target();
+		return -1;
+	}
+
+	*rx_len = (size_t)(bytes_read - 1);
+	return 0;
+}
+
 RESPONSECODE
 IFDHTransmitToICC(DWORD Lun, SCARD_IO_HEADER SendPci, PUCHAR TxBuffer, DWORD
 		TxLength, PUCHAR RxBuffer, PDWORD RxLength, PSCARD_IO_HEADER RecvPci)
 {
 	RESPONSECODE result;
-	ssize_t bytes_read;
-	ssize_t bytes_written;
-
-	unsigned char null_header;
-	struct iovec iov[] = {{&null_header, 1}, {RxBuffer, *RxLength}};
+	size_t rx_len = 0;
 
 	(void)Lun;
 
-	/* Held across send()/readv() below, not just the state checks: the
+	/* Held across raw_transceive() below, not just the state checks: the
 	 * socket fd must not be closed by a concurrent remove_target() (from
 	 * IFDHPolling/IFDHICCPresence on the polling thread) while a
 	 * transceive using it is in flight. */
@@ -1383,37 +1424,13 @@ IFDHTransmitToICC(DWORD Lun, SCARD_IO_HEADER SendPci, PUCHAR TxBuffer, DWORD
 		goto out;
 	}
 
-	do {
-		bytes_written = send(ifdnlnfc_state.socket, TxBuffer, TxLength, MSG_NOSIGNAL);
-	} while (bytes_written < 0 && errno == EINTR);
-
-	if (bytes_written < 0 || (DWORD)bytes_written != TxLength) {
-		Log3(PCSC_LOG_DEBUG, "Wrote %ld bytes instead of %ld", (long)bytes_written, (long)TxLength);
+	if (raw_transceive(TxBuffer, TxLength, RxBuffer, *RxLength, &rx_len)) {
 		*RxLength = 0;
-		remove_target();
 		result = IFD_ICC_NOT_PRESENT;
 		goto out;
 	}
 
-	do {
-		bytes_read = readv(ifdnlnfc_state.socket, iov, 2);
-	} while (bytes_read < 0 && errno == EINTR);
-
-	if (bytes_read == -1) {
-		Log2(PCSC_LOG_DEBUG, "readv() error, errno: %d", errno);
-	}
-
-	if (bytes_read < 1)
-	{
-		*RxLength = 0;
-		remove_target();
-		result = IFD_ICC_NOT_PRESENT;
-		goto out;
-	}
-
-	bytes_read--;
-
-	*RxLength = (DWORD)bytes_read;
+	*RxLength = (DWORD)rx_len;
 	RecvPci->Protocol = SCARD_PROTOCOL_T1;
 
 	result = IFD_SUCCESS;
@@ -1439,6 +1456,8 @@ IFDHICCPresence(DWORD Lun)
 {
 	RESPONSECODE result;
 	int err;
+	unsigned char probe_rx[32];
+	size_t probe_rx_len;
 
 	(void)Lun;
 
@@ -1455,12 +1474,30 @@ IFDHICCPresence(DWORD Lun)
 	}
 
 	if (ifdnlnfc_state.card_present) {
-		/* IFD_POWER_DOWN never touches the kernel-side target (see
-		 * IFDHPowerICC), so while connected there is nothing to
-		 * actively re-probe: the target either is still there, or a
-		 * real communication attempt will discover it isn't. */
-		result = IFD_SUCCESS;
-		goto out;
+		if (ifdnlnfc_state.socket >= 0 &&
+			!atomic_load_explicit(&ifdnlnfc_state.card_powered, memory_order_relaxed)) {
+			/* Empty I-block: zero-length data exchange, exactly
+			 * what linux_libnfc-nci's own RW_T4tPresenceCheck()
+			 * uses by default (RW_T4T_CHK_EMPTY_I_BLOCK, see
+			 * rw_t4t.c). This is a pure ISO 14443-4/T=1
+			 * protocol-layer exchange -- no APDU header, nothing
+			 * for the card to interpret as a command -- so unlike
+			 * a SELECT it cannot disturb whatever application/
+			 * applet a paused client transaction has selected.
+			 * Any response at all is proof of life; only a
+			 * raw_transceive() I/O failure means the target is
+			 * actually gone. */
+			if (!raw_transceive(NULL, 0, probe_rx, sizeof(probe_rx), &probe_rx_len)) {
+				(void)probe_rx_len;
+				result = IFD_SUCCESS;
+				goto out;
+			}
+			/* raw_transceive() already called remove_target() on failure. */
+		}
+		else {
+			result = IFD_SUCCESS;
+			goto out;
+		}
 	}
 
 	if (!ifdnlnfc_state.adapter.poll_active)
