@@ -1310,7 +1310,10 @@ IFDHPowerICC(DWORD Lun, DWORD Action, PUCHAR Atr, PDWORD AtrLength)
 
 	case IFD_RESET:
 	case IFD_POWER_UP:
-		Log1(PCSC_LOG_DEBUG, Action == IFD_RESET ? "IFD_RESET" : "IFD_POWER_UP");
+		if (Action == IFD_RESET)
+			Log1(PCSC_LOG_DEBUG, "IFD_RESET");
+		else
+			Log1(PCSC_LOG_DEBUG, "IFD_POWER_UP");
 
 		if (!ifdnlnfc_state.card_present || !ifdnlnfc_state.target_valid) {
 			result = IFD_ERROR_POWER_ACTION;
