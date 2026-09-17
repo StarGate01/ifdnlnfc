@@ -25,6 +25,7 @@
 #include "config.h"
 #include <ifdhandler.h>
 #include <inttypes.h>
+#include <stdatomic.h>
 
 // constants from the USB CCID IFD Handler by Ludovic Rousseau
 // for consistency
@@ -54,7 +55,19 @@ struct ifdnlnfc_state {
 	struct nfc_adapter adapter;
 	struct nfc_target target;
 	int channel_open;
+	/* A target was reported by a poll and has a valid kernel target index. */
+	int target_valid;
+	/* NFC_EVENT_TARGETS_FOUND for the current target arrived, i.e. the
+	 * kernel still tracks the target represented by "target" above,
+	 * whether or not the raw socket is currently connected to it. */
 	int card_present;
+	/* The NFC adapter itself disappeared (e.g. device removal). */
+	int adapter_removed;
+	/* The PC/SC client has powered the ICC up (IFD_POWER_UP/IFD_RESET
+	 * succeeded, no IFD_POWER_DOWN since). Distinct from card_present:
+	 * we keep the raw socket connected across IFD_POWER_DOWN so the
+	 * kernel target index survives PC/SC's idle power-down cycling. */
+	atomic_int card_powered;
 	int socket;
 };
 

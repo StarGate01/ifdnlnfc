@@ -41,12 +41,15 @@
 #include <poll.h>
 #include <pthread.h>
 #include <reader.h>
+#include <string.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
 static struct nl_sock *cmd_sock, *event_sock;
 static int nfc_family_id;
-static struct ifdnlnfc_state ifdnlnfc_state = {};
+static struct ifdnlnfc_state ifdnlnfc_state = {
+	.socket = -1,
+};
 
 pthread_cond_t target_lost = PTHREAD_COND_INITIALIZER;
 pthread_mutex_t polling_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -400,15 +403,50 @@ nla_put_failure:
 	return err;
 }
 
+static void close_target_socket(void)
+{
+	if (ifdnlnfc_state.socket >= 0)
+		close(ifdnlnfc_state.socket);
+
+	ifdnlnfc_state.socket = -1;
+	atomic_store_explicit(&ifdnlnfc_state.card_powered, 0, memory_order_relaxed);
+}
+
+static void remove_target(void)
+{
+	close_target_socket();
+	memset(&ifdnlnfc_state.target, 0, sizeof(ifdnlnfc_state.target));
+	ifdnlnfc_state.target_valid = 0;
+	ifdnlnfc_state.card_present = 0;
+	pthread_cond_signal(&target_lost);
+}
+
+static void reset_driver_state(void)
+{
+	memset(&ifdnlnfc_state.adapter, 0, sizeof(ifdnlnfc_state.adapter));
+	memset(&ifdnlnfc_state.target, 0, sizeof(ifdnlnfc_state.target));
+	ifdnlnfc_state.channel_open = 0;
+	ifdnlnfc_state.target_valid = 0;
+	ifdnlnfc_state.card_present = 0;
+	ifdnlnfc_state.adapter_removed = 0;
+	atomic_store_explicit(&ifdnlnfc_state.card_powered, 0, memory_order_relaxed);
+	ifdnlnfc_state.socket = -1;
+}
+
 static int event_handler(struct nl_msg *msg, void *arg)
 {
 	struct nlattr *attr[NFC_ATTR_MAX + 1];
 	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
 	uint32_t cmd = gnlh->cmd;
-	int * card_present = arg;
 	uint32_t device_index;
 
-	if (cmd != NFC_EVENT_TARGETS_FOUND || !ifdnlnfc_state.channel_open)
+	(void)arg;
+
+	if (!ifdnlnfc_state.channel_open)
+		return NL_SKIP;
+
+	if (cmd != NFC_EVENT_TARGETS_FOUND && cmd != NFC_EVENT_TARGET_LOST &&
+		cmd != NFC_EVENT_DEVICE_REMOVED)
 		return NL_SKIP;
 
 	nla_parse(attr, NFC_ATTR_MAX, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0), NULL);
@@ -418,13 +456,34 @@ static int event_handler(struct nl_msg *msg, void *arg)
 
 	device_index = nla_get_u32(attr[NFC_ATTR_DEVICE_INDEX]);
 
-	if (device_index == ifdnlnfc_state.adapter.idx) {
-		*card_present = 1;
+	if (device_index != ifdnlnfc_state.adapter.idx)
+		return NL_SKIP;
+
+	if (cmd == NFC_EVENT_DEVICE_REMOVED) {
+		Log2(PCSC_LOG_DEBUG, "NFC adapter removed. Adapter index:%d.", device_index);
+		ifdnlnfc_state.adapter_removed = 1;
+		remove_target();
+		return NL_OK;
+	}
+
+	if (cmd == NFC_EVENT_TARGETS_FOUND) {
+		/* Don't disturb an established connection with a spurious relist. */
+		if (ifdnlnfc_state.socket >= 0)
+			return NL_SKIP;
+		ifdnlnfc_state.card_present = 1;
+		ifdnlnfc_state.target_valid = 0;
 		ifdnlnfc_state.adapter.poll_active = 0;
 		Log2(PCSC_LOG_DEBUG, "NFC_TARGETS_FOUND. Adapter index:%d.", device_index);
 		return NL_OK;
 	}
-	return NL_SKIP;
+
+	/* NFC_EVENT_TARGET_LOST: kernel drivers that implement check_presence
+	 * may emit this; harmless to act on if it ever arrives, but callers
+	 * must not rely on it alone since most drivers never send it. */
+	Log2(PCSC_LOG_DEBUG, "NFC target lost. Adapter index:%d.", device_index);
+	remove_target();
+
+	return NL_OK;
 }
 
 static int family_handler(struct nl_msg *msg, void *arg)
@@ -801,13 +860,6 @@ failure:
 	return err;
 }
 
-static void remove_target() {
-	if (ifdnlnfc_state.socket) close(ifdnlnfc_state.socket);
-	ifdnlnfc_state.socket = 0;
-	ifdnlnfc_state.card_present = 0;
-	pthread_cond_signal(&target_lost);
-}
-
 static int connect_target(struct nfc_adapter *adapter, struct nfc_target *target)
 {
 	int err;
@@ -902,18 +954,15 @@ IFDHCloseChannel(DWORD Lun)
 	if (!ifdnlnfc_state.channel_open)
 		return IFD_COMMUNICATION_ERROR;
 
-	if (ifdnlnfc_state.socket)
-		close(ifdnlnfc_state.socket);
+	close_target_socket();
 
 	stop_poll_for_targets(&ifdnlnfc_state.adapter);
 
 	if (!ifdnlnfc_state.adapter.initial_power)
 		nl_set_powered(&ifdnlnfc_state.adapter, 0);
 
-	ifdnlnfc_state.socket = 0;
-	ifdnlnfc_state.channel_open = 0;
-
 	netlink_cleanup();
+	reset_driver_state();
 
 	return IFD_SUCCESS;
 }
@@ -957,7 +1006,7 @@ IFDHGetCapabilities(DWORD Lun, DWORD Tag, PDWORD Length, PUCHAR Value)
 #ifdef SCARD_ATTR_ATR_STRING
 	case SCARD_ATTR_ATR_STRING:
 #endif
-		if (!ifdnlnfc_state.socket)
+		if (ifdnlnfc_state.socket < 0)
 			return IFD_COMMUNICATION_ERROR;
 		if (*Length < ifdnlnfc_state.target.atr_len)
 			return IFD_ERROR_INSUFFICIENT_BUFFER;
@@ -1016,7 +1065,7 @@ IFDHPowerICC(DWORD Lun, DWORD Action, PUCHAR Atr, PDWORD AtrLength)
 
 	case IFD_RESET:
 		Log1(PCSC_LOG_DEBUG, "IFD_RESET");
-		if (ifdnlnfc_state.socket) {
+		if (ifdnlnfc_state.socket >= 0) {
 			if (!nl_reactivate_target(ifdnlnfc_state.adapter.idx, ifdnlnfc_state.target.idx, ifdnlnfc_state.target.active_protocol) && *AtrLength >= ifdnlnfc_state.target.atr_len) {
 				*AtrLength = ifdnlnfc_state.target.atr_len;
 				memcpy(Atr, &ifdnlnfc_state.target.atr, *AtrLength);
@@ -1066,7 +1115,7 @@ IFDHTransmitToICC(DWORD Lun, SCARD_IO_HEADER SendPci, PUCHAR TxBuffer, DWORD
 	unsigned char null_header;
 	struct iovec iov[] = {{&null_header, 1}, {RxBuffer, *RxLength}};
 
-	if (!ifdnlnfc_state.socket)
+	if (ifdnlnfc_state.socket < 0)
 		return IFD_COMMUNICATION_ERROR;
 
 	if (SendPci.Protocol != 1)
