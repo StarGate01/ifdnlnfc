@@ -25,6 +25,7 @@
 #include "config.h"
 #include <ifdhandler.h>
 #include <inttypes.h>
+#include <linux/nfc.h>
 #include <stdatomic.h>
 
 // constants from the USB CCID IFD Handler by Ludovic Rousseau
@@ -49,6 +50,10 @@ struct nfc_target {
 	uint32_t active_protocol;
 	uint8_t  atr[MAX_ATR_SIZE];
 	int atr_len;
+	/* NFC-A unique identifier (NFC_ATTR_TARGET_NFCID1), for the
+	 * PC/SC Part 10 pseudo-APDU GET DATA(00) extension. */
+	uint8_t  uid[NFC_NFCID1_MAXSIZE];
+	int uid_len;
 };
 
 struct ifdnlnfc_state {

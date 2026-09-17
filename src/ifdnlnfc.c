@@ -283,6 +283,16 @@ static int get_targets_handler(struct nl_msg *msg, void *arg)
 
 	Log3(PCSC_LOG_INFO, "NFC target found. Index: %d, supported protocols: %0x.", state->target->idx, state->target->supported_protocols);
 
+	state->target->uid_len = 0;
+	if (attrs[NFC_ATTR_TARGET_NFCID1]) {
+		int len = nla_len(attrs[NFC_ATTR_TARGET_NFCID1]);
+
+		if (len > (int)sizeof(state->target->uid))
+			len = (int)sizeof(state->target->uid);
+		memcpy(state->target->uid, nla_data(attrs[NFC_ATTR_TARGET_NFCID1]), (size_t)len);
+		state->target->uid_len = len;
+	}
+
 	if (state->target->supported_protocols & NFC_PROTO_ISO14443_B_MASK) {
 
 		if (attrs[NFC_ATTR_TARGET_SENSB_RES])
@@ -1399,6 +1409,117 @@ static int raw_transceive(const unsigned char *tx, size_t tx_len,
 	return 0;
 }
 
+/* PC/SC Part 10 pseudo-APDU extensions used by German eID software (e.g.
+ * AusweisApp2, per BSI TR-03119) to query reader identity and raw target
+ * data a normal ICC-facing APDU can't reach. Every command is a 5-byte
+ * case-2 APDU (FF INS P1 P2 Le, no command data); Le=0 means "return
+ * everything". Mirrors ifdnfc-nci's src/ifdnfc-nci.c IFDHTransmitToICC()
+ * pseudo-APDU handling. Caller must hold state_lock (needs a connected
+ * target for UID/historical bytes) and pass TxBuffer[0] == 0xFF. */
+static RESPONSECODE handle_pseudo_apdu(const unsigned char *tx, size_t tx_len,
+		unsigned char *rx, size_t rx_cap, size_t *rx_len)
+{
+	struct nfc_target *target = &ifdnlnfc_state.target;
+	const unsigned char *data = NULL;
+	size_t data_len = 0;
+	size_t le;
+	size_t off;
+
+	if (tx_len != 5) {
+		if (rx_cap < 2)
+			return IFD_COMMUNICATION_ERROR;
+		rx[0] = 0x67;
+		rx[1] = 0x00;
+		*rx_len = 2;
+		return IFD_SUCCESS;
+	}
+
+	le = tx[4];
+
+	switch (tx[1]) {
+	case 0x9A: /* Reader information */
+		if (tx[2] != 0x01)
+			goto not_supported;
+		switch (tx[3]) {
+		case 0x01: /* Vendor name */
+			data = (const unsigned char *)"Linux NFC";
+			break;
+		case 0x03: /* Product name */
+			data = (const unsigned char *)"Netlink NFC Reader";
+			break;
+		case 0x06: /* Firmware version -- not queryable via the
+			    * generic kernel NFC netlink API, unlike the
+			    * vendor HAL ifdnfc-nci links against. */
+			data = (const unsigned char *)"n/a";
+			break;
+		case 0x07: /* Driver version */
+			data = (const unsigned char *)PACKAGE_VERSION;
+			break;
+		default:
+			goto not_supported;
+		}
+		data_len = strlen((const char *)data);
+		break;
+	case 0xCA: /* Get Data */
+		switch (tx[2]) {
+		case 0x00: /* Get UID */
+			data = target->uid;
+			data_len = (size_t)target->uid_len;
+			break;
+		case 0x01: /* Get ATS historical bytes */
+			if (target->atr_len >= 5) {
+				data = &target->atr[4];
+				data_len = (size_t)(target->atr[1] - 0x80);
+			}
+			break;
+		default:
+			goto not_supported;
+		}
+		break;
+	default:
+		goto not_supported;
+	}
+
+	if (le == 0)
+		le = data_len;
+
+	if (le < data_len) {
+		if (rx_cap < 2)
+			return IFD_COMMUNICATION_ERROR;
+		rx[0] = 0x6C;
+		rx[1] = (unsigned char)data_len;
+		*rx_len = 2;
+		return IFD_SUCCESS;
+	}
+
+	if (rx_cap < le + 2)
+		return IFD_COMMUNICATION_ERROR;
+
+	off = data_len;
+	if (data_len)
+		memcpy(rx, data, data_len);
+	if (le > data_len) {
+		/* End of data reached before Le bytes: pad with zeros. */
+		memset(rx + off, 0, le - data_len);
+		off = le;
+		rx[off++] = 0x62;
+		rx[off++] = 0x82;
+	} else {
+		rx[off++] = 0x90;
+		rx[off++] = 0x00;
+	}
+	*rx_len = off;
+	return IFD_SUCCESS;
+
+not_supported:
+	if (rx_cap < 2)
+		return IFD_COMMUNICATION_ERROR;
+	rx[0] = 0x6A;
+	rx[1] = 0x81;
+	*rx_len = 2;
+	return IFD_SUCCESS;
+}
+
 RESPONSECODE
 IFDHTransmitToICC(DWORD Lun, SCARD_IO_HEADER SendPci, PUCHAR TxBuffer, DWORD
 		TxLength, PUCHAR RxBuffer, PDWORD RxLength, PSCARD_IO_HEADER RecvPci)
@@ -1416,6 +1537,17 @@ IFDHTransmitToICC(DWORD Lun, SCARD_IO_HEADER SendPci, PUCHAR TxBuffer, DWORD
 
 	if (ifdnlnfc_state.socket < 0) {
 		result = IFD_COMMUNICATION_ERROR;
+		goto out;
+	}
+
+	if (TxLength && TxBuffer[0] == 0xFF) {
+		result = handle_pseudo_apdu(TxBuffer, TxLength, RxBuffer, *RxLength, &rx_len);
+		if (result == IFD_SUCCESS) {
+			*RxLength = (DWORD)rx_len;
+			RecvPci->Protocol = SCARD_PROTOCOL_T1;
+		} else {
+			*RxLength = 0;
+		}
 		goto out;
 	}
 
