@@ -715,17 +715,23 @@ nla_put_failure:
 	return err;
 }
 
-static int netlink_cleanup()
+static void netlink_cleanup(void)
 {
-	// no explicit nl_close() necessary
-	nl_socket_free(cmd_sock);
-	nl_socket_free(event_sock);
-	return 0;
+	if (cmd_sock)
+		nl_socket_free(cmd_sock);
+	if (event_sock)
+		nl_socket_free(event_sock);
+
+	cmd_sock = NULL;
+	event_sock = NULL;
+	nfc_family_id = -1;
 }
 
-static int netlink_setup()
+static int netlink_setup(void)
 {
-	int err, group_id;
+	struct nl_cb *cb;
+	int err;
+	int group_id = -1;
 
 	cmd_sock = nl_socket_alloc();
 
@@ -737,58 +743,61 @@ static int netlink_setup()
 	event_sock = nl_socket_alloc();
 
 	if (!event_sock) {
-		nl_socket_free(cmd_sock);
 		Log1(PCSC_LOG_ERROR, "Out of memory");
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto failure;
 	}
 
 	err = genl_connect(cmd_sock);
-	if (err) {
-		netlink_cleanup();
-		return err;
-	}
+	if (err)
+		goto failure;
 
 	err = genl_connect(event_sock);
-	if (err) {
-		netlink_cleanup();
-		return err;
-	}
+	if (err)
+		goto failure;
 
 	err = nl_socket_set_nonblocking(event_sock);
-	if (err) {
-		netlink_cleanup();
-		return err;
-	}
+	if (err)
+		goto failure;
 
 	nfc_family_id = genl_ctrl_resolve(cmd_sock, "nfc");
 	if (nfc_family_id < 0) {
 		Log1(PCSC_LOG_DEBUG, "Unable to find NFC netlink family");
-		err = -ENOENT;
+		err = nfc_family_id;
+		goto failure;
 	}
 
 	err = get_multicast_id(cmd_sock, &group_id);
 
 	if (err) {
 		Log1(PCSC_LOG_DEBUG, "Unable to find multicast group ID");
-		return err;
+		goto failure;
 	}
 
-	struct nl_cb *cb = nl_cb_alloc(NL_CB_VERBOSE);
+	cb = nl_cb_alloc(NL_CB_VERBOSE);
 
 	if (!cb) {
 		Log1(PCSC_LOG_ERROR, "Out of memory");
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto failure;
 	}
 
 	nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, event_handler, &ifdnlnfc_state.card_present);
 	nl_socket_set_cb(event_sock, cb);
+	nl_cb_put(cb);
 	nl_socket_disable_seq_check(event_sock);
 
 	err = nl_socket_add_membership(event_sock, group_id);
 
-	if (err)
+	if (err) {
 		Log1(PCSC_LOG_DEBUG, "Error adding nl socket to notification group");
+		goto failure;
+	}
 
+	return 0;
+
+failure:
+	netlink_cleanup();
 	return err;
 }
 
