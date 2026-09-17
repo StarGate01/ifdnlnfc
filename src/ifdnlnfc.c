@@ -1147,6 +1147,7 @@ static RESPONSECODE IFDHPolling(DWORD Lun, int timeout)
 	uint64_t wake_count;
 	int effective_timeout = timeout;
 	int result;
+	int event_fd_dup, wake_fd_dup;
 
 	(void)Lun;
 
@@ -1160,12 +1161,32 @@ static RESPONSECODE IFDHPolling(DWORD Lun, int timeout)
 	Log4(PCSC_LOG_DEBUG, "card present: %d, poll active: %d, timeout: %d",
 		ifdnlnfc_state.card_present, ifdnlnfc_state.adapter.poll_active, timeout);
 
-	fds[0] = (struct pollfd){nl_socket_get_fd(event_sock), POLLIN, 0};
-	fds[1] = (struct pollfd){polling_wake_fd, POLLIN, 0};
+	/* Duplicate the fds while still holding the lock, and poll/read the
+	 * duplicates instead of the originals below. A concurrent
+	 * IFDHCloseChannel() (called from a different pcscd thread while we
+	 * are blocked in poll()) tears down event_sock/polling_wake_fd via
+	 * netlink_cleanup(), which would otherwise leave us polling (and,
+	 * for the wake fd, re-reading) closed -- and potentially reused --
+	 * file descriptor numbers. dup() gives us our own reference to the
+	 * same underlying open file description, so it keeps working
+	 * correctly regardless of what happens to the originals. */
+	event_fd_dup = dup(nl_socket_get_fd(event_sock));
+	wake_fd_dup = dup(polling_wake_fd);
 
 	/* Release the lock before the (potentially multi-second) blocking
 	 * wait below, so other IFDH* entry points are not stalled by it. */
 	pthread_mutex_unlock(&state_lock);
+
+	if (event_fd_dup < 0 || wake_fd_dup < 0) {
+		if (event_fd_dup >= 0)
+			close(event_fd_dup);
+		if (wake_fd_dup >= 0)
+			close(wake_fd_dup);
+		return IFD_COMMUNICATION_ERROR;
+	}
+
+	fds[0] = (struct pollfd){event_fd_dup, POLLIN, 0};
+	fds[1] = (struct pollfd){wake_fd_dup, POLLIN, 0};
 
 	/* While the ICC is not currently powered by the PC/SC client, there
 	 * is no reliable kernel event for the tag leaving the field (most
@@ -1180,15 +1201,20 @@ static RESPONSECODE IFDHPolling(DWORD Lun, int timeout)
 		result = poll(fds, 2, effective_timeout);
 	} while (result < 0 && errno == EINTR);
 
+	if (result >= 0 && (fds[1].revents & POLLIN)) {
+		int read_result;
+
+		do {
+			read_result = read(wake_fd_dup, &wake_count, sizeof(wake_count));
+		} while (read_result < 0 && errno == EINTR);
+	}
+
+	close(event_fd_dup);
+	close(wake_fd_dup);
+
 	if (result < 0 || (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) ||
 		(fds[1].revents & (POLLERR | POLLHUP | POLLNVAL)))
 		return IFD_COMMUNICATION_ERROR;
-
-	if (fds[1].revents & POLLIN) {
-		do {
-			result = read(polling_wake_fd, &wake_count, sizeof(wake_count));
-		} while (result < 0 && errno == EINTR);
-	}
 
 	return IFD_SUCCESS;
 }
