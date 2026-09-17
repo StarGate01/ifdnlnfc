@@ -42,17 +42,20 @@
 #include <pthread.h>
 #include <reader.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
+/* While the PC/SC client has logically powered the card down, re-probe its
+ * presence at least this often so removal is still noticed promptly. */
+#define PRESENCE_PROBE_INTERVAL_MS 3000
+
 static struct nl_sock *cmd_sock, *event_sock;
 static int nfc_family_id;
+static int polling_wake_fd = -1;
 static struct ifdnlnfc_state ifdnlnfc_state = {
 	.socket = -1,
 };
-
-pthread_cond_t target_lost = PTHREAD_COND_INITIALIZER;
-pthread_mutex_t polling_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int nl_error_handler(struct sockaddr_nl *nla, struct nlmsgerr *err,
 			void *arg)
@@ -403,6 +406,19 @@ nla_put_failure:
 	return err;
 }
 
+static void wake_polling_thread(void)
+{
+	uint64_t value = 1;
+	ssize_t written;
+
+	if (polling_wake_fd < 0)
+		return;
+
+	do {
+		written = write(polling_wake_fd, &value, sizeof(value));
+	} while (written < 0 && errno == EINTR);
+}
+
 static void close_target_socket(void)
 {
 	if (ifdnlnfc_state.socket >= 0)
@@ -418,7 +434,7 @@ static void remove_target(void)
 	memset(&ifdnlnfc_state.target, 0, sizeof(ifdnlnfc_state.target));
 	ifdnlnfc_state.target_valid = 0;
 	ifdnlnfc_state.card_present = 0;
-	pthread_cond_signal(&target_lost);
+	wake_polling_thread();
 }
 
 static void reset_driver_state(void)
@@ -780,9 +796,12 @@ static void netlink_cleanup(void)
 		nl_socket_free(cmd_sock);
 	if (event_sock)
 		nl_socket_free(event_sock);
+	if (polling_wake_fd >= 0)
+		close(polling_wake_fd);
 
 	cmd_sock = NULL;
 	event_sock = NULL;
+	polling_wake_fd = -1;
 	nfc_family_id = -1;
 }
 
@@ -850,6 +869,12 @@ static int netlink_setup(void)
 
 	if (err) {
 		Log1(PCSC_LOG_DEBUG, "Error adding nl socket to notification group");
+		goto failure;
+	}
+
+	polling_wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+	if (polling_wake_fd < 0) {
+		err = -errno;
 		goto failure;
 	}
 
@@ -969,27 +994,39 @@ IFDHCloseChannel(DWORD Lun)
 
 static RESPONSECODE IFDHPolling(DWORD Lun, int timeout)
 {
-	struct timespec deadline;
-	struct pollfd fd = {nl_socket_get_fd(event_sock), POLLIN, 0};
-	Log4(PCSC_LOG_DEBUG, "card present: %d, poll active: %d, timeout: %d", ifdnlnfc_state.card_present, ifdnlnfc_state.adapter.poll_active, timeout);
+	struct pollfd fds[2];
+	uint64_t wake_count;
+	int effective_timeout = timeout;
+	int result;
 
-	if (ifdnlnfc_state.card_present && !clock_gettime(CLOCK_REALTIME, &deadline)) {
-		deadline.tv_nsec += (timeout % 1000) * 1000000;
-		deadline.tv_sec += timeout / 1000;
-		if (deadline.tv_nsec > 999999999) {
-			deadline.tv_nsec -= 1000000000;
-			deadline.tv_sec += 1;
-		}
-		pthread_mutex_lock(&polling_lock);
-		if (!pthread_cond_timedwait(&target_lost, &polling_lock, &deadline))
-			Log1(PCSC_LOG_DEBUG, "Target gone, polling thread woken up.");
-		pthread_mutex_unlock(&polling_lock);
-		return IFD_SUCCESS;
-	}
-	else if (poll(&fd, 1, timeout) != -1)
-		return IFD_SUCCESS;
+	if (!event_sock || polling_wake_fd < 0)
+		return IFD_COMMUNICATION_ERROR;
 
-	return IFD_COMMUNICATION_ERROR;
+	Log4(PCSC_LOG_DEBUG, "card present: %d, poll active: %d, timeout: %d",
+		ifdnlnfc_state.card_present, ifdnlnfc_state.adapter.poll_active, timeout);
+
+	fds[0] = (struct pollfd){nl_socket_get_fd(event_sock), POLLIN, 0};
+	fds[1] = (struct pollfd){polling_wake_fd, POLLIN, 0};
+
+	/* While the ICC is not currently powered by the PC/SC client, there
+	 * is no reliable kernel event for the tag leaving the field (most
+	 * NCI drivers, including nxp-nci, never implement check_presence /
+	 * emit NFC_EVENT_TARGET_LOST). Wake up periodically instead so
+	 * IFDHICCPresence can actively re-probe. */
+	if (!atomic_load_explicit(&ifdnlnfc_state.card_powered, memory_order_relaxed) &&
+		(timeout < 0 || timeout > PRESENCE_PROBE_INTERVAL_MS))
+		effective_timeout = PRESENCE_PROBE_INTERVAL_MS;
+
+	result = poll(fds, 2, effective_timeout);
+
+	if (result < 0 || (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) ||
+		(fds[1].revents & (POLLERR | POLLHUP | POLLNVAL)))
+		return IFD_COMMUNICATION_ERROR;
+
+	if (fds[1].revents & POLLIN)
+		result = read(polling_wake_fd, &wake_count, sizeof(wake_count));
+
+	return IFD_SUCCESS;
 }
 
 RESPONSECODE
