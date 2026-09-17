@@ -177,7 +177,7 @@ nla_put_failure:
 	return err;
 }
 
-static int set_atr_from_hb(struct nfc_target *target, unsigned char * hb, int hb_len)
+static int set_atr_from_hb(struct nfc_target *target, const unsigned char *hb, int hb_len)
 {
 	int len = 4 + hb_len;
 
@@ -202,6 +202,46 @@ static int set_atr_from_hb(struct nfc_target *target, unsigned char * hb, int hb
 
 	target->atr[len] = tck;
 	target->atr_len = len + 1;
+
+	return 0;
+}
+
+/*
+ * Split the historical bytes out of an ISO 14443-4 ATS as delivered by the
+ * kernel's NFC_ATTR_TARGET_ATS attribute.
+ *
+ * That attribute does NOT include the leading TL (total length) byte of the
+ * raw ISO 14443-4 ATS: net/nfc/nci/ntf.c reads and consumes the NCI "RATS
+ * Response Length" byte itself and copies only the bytes from T0 onward into
+ * target_ats, so ats[0] here is T0, not TL, and ats_len counts T0 onward.
+ *
+ * On success, *historical_bytes is set to a pointer into ats (or NULL if
+ * there are no historical bytes) and *historical_bytes_len to their count.
+ * Returns 0 on success, -1 if ats is malformed.
+ */
+static int ats_historical_bytes(const uint8_t *ats, size_t ats_len,
+		const uint8_t **historical_bytes, size_t *historical_bytes_len)
+{
+	size_t offset = 1;
+	uint8_t t0;
+
+	*historical_bytes = NULL;
+	*historical_bytes_len = 0;
+
+	if (!ats || ats_len < 1)
+		return -1;
+
+	t0 = ats[0];
+	if (t0 & 0x10) offset++; /* TA(1) present */
+	if (t0 & 0x20) offset++; /* TB(1) present */
+	if (t0 & 0x40) offset++; /* TC(1) present */
+
+	if (offset > ats_len)
+		return -1;
+
+	*historical_bytes_len = ats_len - offset;
+	if (*historical_bytes_len)
+		*historical_bytes = ats + offset;
 
 	return 0;
 }
@@ -255,11 +295,11 @@ static int get_target_ats_handler(struct nl_msg *msg, void *arg)
 {
 	struct nlmsghdr *nlh = nlmsg_hdr(msg);
 	struct nlattr *attrs[NFC_ATTR_MAX + 1];
-	int hb_len = 0;
-	unsigned char * hb = NULL;
+	const unsigned char *hb = NULL;
+	size_t hb_len = 0;
 
 	int ats_len = 0;
-	unsigned char * ats = NULL;
+	const unsigned char *ats = NULL;
 
 	struct list_targets_cb_state *state = arg;
 
@@ -279,19 +319,10 @@ static int get_target_ats_handler(struct nl_msg *msg, void *arg)
 		Log1(PCSC_LOG_DEBUG, "ATS not present");
 	}
 
-	if (ats_len > 1) {
-		hb_len = ats_len - 1;
-		if (ats[0] & 0x40) hb_len--;
-		if (ats[0] & 0x20) hb_len--;
-		if (ats[0] & 0x10) hb_len--;
-		if (hb_len > 0) hb = ats_len - hb_len + ats;
-		if (hb_len < 0) {
-			Log1(PCSC_LOG_ERROR, "ATS invalid");
-			hb_len = 0;
-		}
-	}
+	if (ats && ats_historical_bytes(ats, (size_t)ats_len, &hb, &hb_len))
+		Log1(PCSC_LOG_ERROR, "ATS invalid");
 
-	set_atr_from_hb(state->target, hb, hb_len);
+	set_atr_from_hb(state->target, hb, (int)hb_len);
 
 	return NL_OK;
 }
