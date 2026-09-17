@@ -1139,7 +1139,7 @@ static RESPONSECODE IFDHPolling(DWORD Lun, int timeout)
 	 * is no reliable kernel event for the tag leaving the field (most
 	 * NCI drivers, including nxp-nci, never implement check_presence /
 	 * emit NFC_EVENT_TARGET_LOST). Wake up periodically instead so
-	 * IFDHICCPresence can actively re-probe via target reactivation. */
+	 * IFDHICCPresence can actively re-probe with an empty I-block. */
 	if (!atomic_load_explicit(&ifdnlnfc_state.card_powered, memory_order_relaxed) &&
 		(timeout < 0 || timeout > PRESENCE_PROBE_INTERVAL_MS))
 		effective_timeout = PRESENCE_PROBE_INTERVAL_MS;
@@ -1339,7 +1339,7 @@ IFDHPowerICC(DWORD Lun, DWORD Action, PUCHAR Atr, PDWORD AtrLength)
 		 * the kernel target and force PC/SC's next power-up through
 		 * a fresh discovery cycle, churning the target index and
 		 * dropping any external chip configuration. IFDHICCPresence
-		 * reactivates the same target on demand instead. */
+		 * probes it with an empty I-block on demand instead. */
 		atomic_store_explicit(&ifdnlnfc_state.card_powered, 0, memory_order_relaxed);
 		wake_polling_thread();
 		result = IFD_SUCCESS;
