@@ -594,7 +594,7 @@ static int get_device_handler(struct nl_msg *n, void *arg)
 	struct nlmsghdr *nlh = nlmsg_hdr(n);
 	struct nlattr *attrs[NFC_ATTR_MAX + 1];
 	uint32_t protocols = 0;
-	uint8_t powered, rf_mode;
+	uint8_t powered = 0, rf_mode = NFC_RF_NONE;
 
 	struct get_adapter_cb_state *state = arg;
 
@@ -617,6 +617,7 @@ static int get_device_handler(struct nl_msg *n, void *arg)
 		state->adapter->idx = state->idx;
 		state->adapter->initial_mode = rf_mode;
 		state->adapter->initial_power = powered;
+		state->adapter->protocols = protocols;
 		Log4(PCSC_LOG_INFO, "NFC adapter found. Index: %d, powered: %d, supported protocols: %0x.", state->adapter->idx, powered, protocols);
 		Log2(PCSC_LOG_DEBUG, "Adapter Mode: %d", rf_mode);
 		return NL_OK;
@@ -629,7 +630,7 @@ static int list_devices_handler(struct nl_msg *n, void *arg)
 	struct nlmsghdr *nlh = nlmsg_hdr(n);
 	struct nlattr *attrs[NFC_ATTR_MAX + 1];
 	uint32_t protocols = 0;
-	uint8_t powered, rf_mode;
+	uint8_t powered = 0, rf_mode = NFC_RF_NONE;
 
 	struct list_adapters_cb_state * state = arg;
 
@@ -657,6 +658,7 @@ static int list_devices_handler(struct nl_msg *n, void *arg)
 		state->adapter->idx = nla_get_u32(attrs[NFC_ATTR_DEVICE_INDEX]);
 		state->adapter->initial_mode = rf_mode;
 		state->adapter->initial_power = powered;
+		state->adapter->protocols = protocols;
 		Log5(PCSC_LOG_INFO, "NFC adapter found. Name: %s, Index: %d, powered: %d, supported protocols: %0x.", state->name, state->adapter->idx, powered, protocols);
 		Log2(PCSC_LOG_DEBUG, "Adapter Mode: %d", rf_mode);
 	}
@@ -668,11 +670,15 @@ static int poll_for_targets(struct nfc_adapter * adapter)
 	struct nl_msg *msg;
 	void *hdr;
 	int err = -EINVAL;
+	uint32_t protocols = adapter->protocols &
+		(NFC_PROTO_ISO14443_MASK | NFC_PROTO_ISO14443_B_MASK);
 
-	if (ifdnlnfc_state.adapter.poll_active) {
+	if (adapter->poll_active) {
 		Log2(PCSC_LOG_ERROR, "Poll active, not starting. Adapter index: %d.", adapter->idx);
 		return 0;
 	}
+	if (!protocols)
+		return -EOPNOTSUPP;
 
 	msg = nlmsg_alloc();
 	if (!msg)
@@ -686,7 +692,7 @@ static int poll_for_targets(struct nfc_adapter * adapter)
 	}
 
 	NLA_PUT_U32(msg, NFC_ATTR_DEVICE_INDEX, adapter->idx);
-	NLA_PUT_U32(msg, NFC_ATTR_IM_PROTOCOLS, NFC_PROTO_ISO14443_MASK |  NFC_PROTO_ISO14443_B_MASK);
+	NLA_PUT_U32(msg, NFC_ATTR_IM_PROTOCOLS, protocols);
 
 	err = nl_send_msg(cmd_sock, msg, NULL, NULL);
 
@@ -694,7 +700,7 @@ static int poll_for_targets(struct nfc_adapter * adapter)
 		Log3(PCSC_LOG_ERROR, "Error %x starting NFC target poll. Adapter index: %d.", err, adapter->idx);
 	else {
 		Log2(PCSC_LOG_DEBUG, "NFC target poll started. Adapter index:%d.", adapter->idx);
-		ifdnlnfc_state.adapter.poll_active = 1;
+		adapter->poll_active = 1;
 	}
 
 nla_put_failure:
