@@ -1419,7 +1419,15 @@ IFDHTransmitToICC(DWORD Lun, SCARD_IO_HEADER SendPci, PUCHAR TxBuffer, DWORD
 		goto out;
 	}
 
-	if (SendPci.Protocol != SCARD_PROTOCOL_T1) {
+	/* SendPci.Protocol is NOT the SCARD_PROTOCOL_* bitmask (T0=1, T1=2):
+	 * winscard.c's SCardTransmit() remaps it to a plain 0 (T=0) / 1 (T=1)
+	 * before calling the IFD handler ("PC/SC starts at 1 for bit masking
+	 * but the IFD_Handler just wants 0 or 1", per its own comment) --
+	 * unlike IFDHSetProtocolParameters()'s Protocol argument, which is
+	 * the real, unremapped SCARD_PROTOCOL_* value. Comparing against
+	 * SCARD_PROTOCOL_T1 (2) here instead of 1 meant this rejected every
+	 * transmit unconditionally, on any protocol. */
+	if (SendPci.Protocol != 1) {
 		result = IFD_NOT_SUPPORTED;
 		goto out;
 	}
