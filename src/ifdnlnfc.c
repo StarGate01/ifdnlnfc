@@ -186,39 +186,6 @@ nla_put_failure:
 	return err;
 }
 
-static int nl_reactivate_target(uint32_t adapter_idx, uint32_t target_idx, uint32_t protocol)
-{
-	struct nl_msg *msg;
-	void *hdr;
-	int err;
-	uint8_t cmd;
-
-	msg = nlmsg_alloc();
-	if (!msg)
-		return -ENOMEM;
-
-	cmd = NFC_CMD_ACTIVATE_TARGET;
-
-	hdr = genlmsg_put(msg, NL_AUTO_PID, NL_AUTO_SEQ, nfc_family_id, 0,
-			NLM_F_REQUEST, cmd, NFC_GENL_VERSION);
-	if (!hdr) {
-		err = -EINVAL;
-		goto nla_put_failure;
-	}
-
-	err = -EMSGSIZE;
-
-	NLA_PUT_U32(msg, NFC_ATTR_DEVICE_INDEX, adapter_idx);
-	NLA_PUT_U32(msg, NFC_ATTR_TARGET_INDEX, target_idx);
-	NLA_PUT_U32(msg, NFC_ATTR_PROTOCOLS, protocol);
-
-	err = nl_send_msg(cmd_sock, msg, NULL, NULL);
-
-nla_put_failure:
-	nlmsg_free(msg);
-	return err;
-}
-
 static int set_atr_from_hb(struct nfc_target *target, const unsigned char *hb, int hb_len)
 {
 	int len = 4 + hb_len;
@@ -975,26 +942,6 @@ static int connect_target(struct nfc_adapter *adapter, struct nfc_target *target
 	return err;
 }
 
-static int reactivate_current_target(void)
-{
-	int err;
-
-	if (!ifdnlnfc_state.target_valid || ifdnlnfc_state.socket < 0)
-		return -ENOTCONN;
-
-	err = nl_reactivate_target(ifdnlnfc_state.adapter.idx,
-		ifdnlnfc_state.target.idx, ifdnlnfc_state.target.active_protocol);
-	if (err)
-		return err;
-
-	if (ifdnlnfc_state.target.active_protocol == NFC_PROTO_ISO14443) {
-		set_atr_from_hb(&ifdnlnfc_state.target, NULL, 0);
-		get_target_ats(&ifdnlnfc_state.adapter, &ifdnlnfc_state.target);
-	}
-
-	return 0;
-}
-
 static int initialize_adapter(struct nfc_adapter *adapter)
 {
 	int err;
@@ -1359,9 +1306,10 @@ IFDHPowerICC(DWORD Lun, DWORD Action, PUCHAR Atr, PDWORD AtrLength)
 
 		if (ifdnlnfc_state.socket >= 0)
 			/* Already connected (kept alive across a prior
-			 * IFD_POWER_DOWN): bring the target back to ACTIVE
-			 * state rather than reconnecting from scratch. */
-			err = reactivate_current_target();
+			 * IFD_POWER_DOWN, which never touches the kernel-side
+			 * target -- see below): the target was never actually
+			 * deactivated, so there is nothing to redo here. */
+			err = 0;
 		else
 			err = connect_target(&ifdnlnfc_state.adapter, &ifdnlnfc_state.target);
 
@@ -1507,26 +1455,12 @@ IFDHICCPresence(DWORD Lun)
 	}
 
 	if (ifdnlnfc_state.card_present) {
-		if (ifdnlnfc_state.socket >= 0 &&
-			!atomic_load_explicit(&ifdnlnfc_state.card_powered, memory_order_relaxed)) {
-			/* Logically powered down but kept connected: actively
-			 * re-probe presence via target reactivation, since no
-			 * kernel event reliably tells us if the tag left the
-			 * field while we were idle. */
-			err = reactivate_current_target();
-			if (err) {
-				Log2(PCSC_LOG_DEBUG, "NFC presence probe failed: %d", err);
-				remove_target();
-			}
-			else {
-				result = IFD_SUCCESS;
-				goto out;
-			}
-		}
-		else {
-			result = IFD_SUCCESS;
-			goto out;
-		}
+		/* IFD_POWER_DOWN never touches the kernel-side target (see
+		 * IFDHPowerICC), so while connected there is nothing to
+		 * actively re-probe: the target either is still there, or a
+		 * real communication attempt will discover it isn't. */
+		result = IFD_SUCCESS;
+		goto out;
 	}
 
 	if (!ifdnlnfc_state.adapter.poll_active)
