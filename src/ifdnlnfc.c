@@ -725,13 +725,13 @@ nla_put_failure:
 	return err;
 }
 
-static int stop_poll_for_targets(struct nfc_adapter * adapter)
+static int stop_poll_for_targets_ex(struct nfc_adapter * adapter, int force)
 {
 	struct nl_msg *msg;
 	void *hdr;
 	int err = -EINVAL;
 
-	if (!adapter->poll_active) {
+	if (!force && !adapter->poll_active) {
 		Log2(PCSC_LOG_INFO, "Poll not active, nothing to stop. Adapter index: %d.", adapter->idx);
 		return 0;
 	}
@@ -763,6 +763,11 @@ static int stop_poll_for_targets(struct nfc_adapter * adapter)
 nla_put_failure:
 	nlmsg_free(msg);
 	return err;
+}
+
+static int stop_poll_for_targets(struct nfc_adapter * adapter)
+{
+	return stop_poll_for_targets_ex(adapter, 0);
 }
 
 static int get_adapter_by_idx(uint32_t idx, struct nfc_adapter *adapter)
@@ -1001,15 +1006,21 @@ static int initialize_adapter(struct nfc_adapter *adapter)
 
 	if (adapter->initial_power) {
 		/* The adapter is already up, presumably brought up and
-		 * proprietary-initialized by npc300-init at boot/resume.
+		 * proprietary-initialized by nlnfc-init at boot/resume.
 		 * Powering it down and back up here would discard that
 		 * (volatile) configuration, so only clear a poll left
-		 * running by an interrupted previous session. */
-		adapter->poll_active = 1;
-		err = stop_poll_for_targets(adapter);
+		 * running by an interrupted previous session. This is
+		 * best-effort cleanup, not a precondition: nlnfc-init itself
+		 * never starts polling, so on the common path there is
+		 * nothing to stop, and the kernel's response to that varies
+		 * (observed -EINVAL, but also other codes). Never fail the
+		 * whole channel open over it -- if the adapter is genuinely
+		 * in a bad state, poll_for_targets() below will fail loudly
+		 * instead. */
+		err = stop_poll_for_targets_ex(adapter, 1);
 		adapter->poll_active = 0;
 		if (err)
-			return -1;
+			Log2(PCSC_LOG_INFO, "Ignoring stop-poll error %d while reusing an already-powered adapter.", err);
 	}
 	else {
 		err = nl_set_powered(adapter, 1);
