@@ -652,14 +652,13 @@ static int get_adapter_by_name(const char * adapter_name, struct nfc_adapter * a
 
 	err = nl_send_msg(cmd_sock, msg, list_devices_handler, &state);
 
-	if (!err || !state.found) {
+	if (err || !state.found) {
 		err = -ENODEV;
 		Log2(PCSC_LOG_INFO, "Adapter %s not found.", adapter_name);
 	}
 
-	nlmsg_free(msg);
-
 nla_put_failure:
+	nlmsg_free(msg);
 	return err;
 }
 
