@@ -1626,7 +1626,17 @@ IFDHICCPresence(DWORD Lun)
 			 * applet a paused client transaction has selected.
 			 * Any response at all is proof of life; only a
 			 * raw_transceive() I/O failure means the target is
-			 * actually gone. */
+			 * actually gone.
+			 *
+			 * Note this needs a kernel that accepts zero-length
+			 * NCI data packets. Between d24b03535e5e ("nfc: nci:
+			 * Fix uninit-value in nci_dev_up and nci_ntf_packet",
+			 * v6.9) and the fix for it, nci_valid_size() discarded
+			 * every zero-length packet, so the tag's empty I-block
+			 * reply was dropped inside the kernel and this probe
+			 * could only ever end in -ETIMEDOUT -- making a tag
+			 * that never left the field look like it was being
+			 * removed and rediscovered every few seconds. */
 			if (!raw_transceive(NULL, 0, probe_rx, sizeof(probe_rx), &probe_rx_len)) {
 				(void)probe_rx_len;
 				result = IFD_SUCCESS;
