@@ -130,7 +130,18 @@ static int nl_send_msg(struct nl_sock *sock, struct nl_msg *msg,
 	while (err == 0 && done == 0) {
 		int recv_err = nl_recvmsgs(sock, cb);
 
-		if (recv_err < 0)
+		/*
+		 * nl_error_handler() already wrote the real kernel-side errno
+		 * from the NLMSG_ERROR ack straight into err (it fires
+		 * synchronously inside nl_recvmsgs() above). nl_recvmsgs()'s
+		 * own return value in that case is a *separate*,
+		 * libnl-internal re-encoding of that same event (its NLE_*
+		 * error space, e.g. NLE_INVAL=7 for EINVAL=22) and must not
+		 * be allowed to clobber the real value. Only treat a negative
+		 * return as a hard failure when neither callback fired at
+		 * all, i.e. a genuine transport-level receive failure.
+		 */
+		if (recv_err < 0 && err == 0 && done == 0)
 			err = recv_err;
 	}
 
