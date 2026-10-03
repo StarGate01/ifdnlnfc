@@ -29,6 +29,7 @@
 #include "config.h"
 
 #include "ifdnlnfc.h"
+#include <dbus/dbus.h>
 #include <debuglog.h>
 #include <errno.h>
 #include <ifdhandler.h>
@@ -659,6 +660,88 @@ static int list_devices_handler(struct nl_msg *n, void *arg)
 	return NL_SKIP;
 }
 
+/* Best-effort cooperation with neard over D-Bus for the idle-contention
+ * case where it holds the kernel's single cross-process poll lock
+ * (nfc_start_poll()'s dev->polling flag in net/nfc/core.c) via
+ * ConstantPoll. There is no kernel-level preemption to use instead -- see
+ * NEARD-COEXISTENCE.md for the full analysis. Never a hard dependency: any
+ * failure here (neard not running, not owning this adapter, bus policy
+ * denying pcscd, a timeout, ...) is logged quietly and otherwise ignored;
+ * ifdnlnfc must keep working exactly as without this when neard is not in
+ * the picture. */
+#define NEARD_DBUS_TIMEOUT_MS 300
+
+static int neard_dbus_call(uint32_t idx, const char *method,
+		const char *str_arg)
+{
+	DBusConnection *conn;
+	DBusError error;
+	DBusMessage *msg, *reply;
+	char path[32];
+	int ret = -1;
+
+	dbus_error_init(&error);
+
+	/* A private connection, opened and closed around this one call, not
+	 * the shared per-process default connection -- and must not take
+	 * pcscd down if neard or the bus daemon itself is misbehaving. */
+	conn = dbus_bus_get_private(DBUS_BUS_SYSTEM, &error);
+	if (!conn) {
+		Log2(PCSC_LOG_DEBUG, "No system D-Bus connection for neard handoff: %s", error.message);
+		dbus_error_free(&error);
+		return -1;
+	}
+	dbus_connection_set_exit_on_disconnect(conn, FALSE);
+
+	snprintf(path, sizeof(path), "/org/neard/nfc%u", idx);
+
+	msg = dbus_message_new_method_call("org.neard", path, "org.neard.Adapter", method);
+	if (!msg)
+		goto out_close;
+
+	if (str_arg && !dbus_message_append_args(msg, DBUS_TYPE_STRING, &str_arg, DBUS_TYPE_INVALID)) {
+		dbus_message_unref(msg);
+		goto out_close;
+	}
+
+	/* Short timeout: this must never stall pcscd's polling thread
+	 * noticeably waiting on a possibly-hung neard. */
+	reply = dbus_connection_send_with_reply_and_block(conn, msg, NEARD_DBUS_TIMEOUT_MS, &error);
+	dbus_message_unref(msg);
+
+	if (!reply) {
+		/* Routine and expected whenever neard is not running, does
+		 * not own this adapter, or the pcscd<->org.neard bus policy
+		 * is not in place -- not worth louder logging. */
+		Log4(PCSC_LOG_DEBUG, "neard %s on %s did not succeed: %s", method, path, error.message);
+		dbus_error_free(&error);
+		goto out_close;
+	}
+
+	dbus_message_unref(reply);
+	ret = 0;
+
+out_close:
+	dbus_connection_close(conn);
+	dbus_connection_unref(conn);
+	return ret;
+}
+
+/* Ask neard to give up the adapter it is continuously polling, so our own
+ * START_POLL has a chance to succeed. */
+static void neard_yield_adapter(uint32_t idx)
+{
+	neard_dbus_call(idx, "StopPollLoop", NULL);
+}
+
+/* Hand the adapter back once our own idle poll cycle comes up empty, so
+ * neard is not starved for as long as pcscd keeps running. Empty string
+ * argument matches what neardevil itself passes to StartPollLoop(). */
+static void neard_reclaim_adapter(uint32_t idx)
+{
+	neard_dbus_call(idx, "StartPollLoop", "");
+}
+
 static int poll_for_targets(struct nfc_adapter * adapter)
 {
 	struct nl_msg *msg;
@@ -689,6 +772,14 @@ static int poll_for_targets(struct nfc_adapter * adapter)
 	NLA_PUT_U32(msg, NFC_ATTR_IM_PROTOCOLS, protocols);
 
 	err = nl_send_msg(cmd_sock, msg, NULL, NULL);
+
+	if (err == -EBUSY) {
+		/* Most likely neard's ConstantPoll holding the kernel's
+		 * single cross-process poll lock -- ask it to yield and
+		 * retry once before giving up. See NEARD-COEXISTENCE.md. */
+		neard_yield_adapter(adapter->idx);
+		err = nl_send_msg(cmd_sock, msg, NULL, NULL);
+	}
 
 	if (err)
 		Log3(PCSC_LOG_ERROR, "Error %x starting NFC target poll. Adapter index: %d.", err, adapter->idx);
@@ -1743,6 +1834,13 @@ IFDHICCPresence(DWORD Lun)
 		result = load_current_target() ? IFD_COMMUNICATION_ERROR : IFD_SUCCESS;
 		goto out;
 	}
+
+	/* This idle cycle came up empty: release the poll session instead of
+	 * leaving it held until the next call, so neard gets a real window
+	 * to poll between now and then. See NEARD-COEXISTENCE.md. */
+	stop_poll_for_targets(&ifdnlnfc_state.adapter);
+	neard_reclaim_adapter(ifdnlnfc_state.adapter.idx);
+
 	result = IFD_ICC_NOT_PRESENT;
 
 out:

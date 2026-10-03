@@ -175,11 +175,23 @@ integration too, with no way back short of restarting pcscd.
 
 `IFDHICCPresence()` needs to stop treating "I already have a poll session
 open" as a steady state to leave alone, and instead release it every time
-a cycle comes up empty:
+a cycle comes up empty.
 
-- When a poll cycle's wait (the existing `nl_recvmsgs_default(event_sock)`
-  call and the `timeout` handling around `src/ifdnlnfc.c:1136`) ends without
-  a target having been found this cycle, explicitly
+Note the actual blocking wait-with-timeout lives one level up, in
+`IFDHPolling()`'s `poll()` call (`src/ifdnlnfc.c:1169`-ish, on the duplicated
+`event_sock`/wake fds) — that's pcscd's dedicated polling thread blocking
+between cycles, called *before* `IFDHICCPresence()` on each iteration.
+`IFDHICCPresence()`'s own `nl_recvmsgs_default(event_sock)` call
+(`src/ifdnlnfc.c:1734`) doesn't block at all: `event_sock` is set
+non-blocking at setup (`nl_socket_set_nonblocking()`, `src/ifdnlnfc.c:861`),
+so this just drains whatever events are already queued and returns
+immediately. The yield point below is about what `IFDHICCPresence()` does
+*after* that drain, not about the wait itself.
+
+- When a poll cycle comes up empty — `nl_recvmsgs_default(event_sock)` at
+  line 1734 has returned, `card_present` is still false, and
+  `IFDHICCPresence()` is about to fall through to
+  `result = IFD_ICC_NOT_PRESENT` (`src/ifdnlnfc.c:1741`-`1746`) — explicitly
   `stop_poll_for_targets(&ifdnlnfc_state.adapter)` and then
   `neard_reclaim_adapter(adapter->idx)` **before returning** from
   `IFDHICCPresence()`, rather than leaving `poll_active` set for the next
@@ -244,9 +256,10 @@ starts.
   `nl_send_msg()`, call `neard_yield_adapter(adapter->idx)` and retry the
   `nl_send_msg()` once before giving up and returning the error as today.
 - In `IFDHICCPresence()` (`src/ifdnlnfc.c:1669`), at the point where the
-  current cycle's wait has ended (`nl_recvmsgs_default`/`timeout` handling
-  around line 1136) without a target found: call
-  `stop_poll_for_targets(&ifdnlnfc_state.adapter)` followed by
+  current cycle's (non-blocking) `nl_recvmsgs_default(event_sock)` drain at
+  line 1734 has completed without a target found — i.e. right before the
+  fall-through to `result = IFD_ICC_NOT_PRESENT` around lines 1741-1746 —
+  call `stop_poll_for_targets(&ifdnlnfc_state.adapter)` followed by
   `neard_reclaim_adapter(adapter->idx)` before returning — this is the new
   per-cycle yield point, replacing the channel-close-only one from the
   first pass of this plan (see "Why yield at `IFDHCloseChannel` doesn't
@@ -258,6 +271,57 @@ starts.
   `stop_poll_for_targets()` wrapper as today; a `neard_reclaim_adapter()`
   call there too is harmless (best-effort, idempotent) but no longer the
   *only* place it happens.
+
+### Lock scope around the D-Bus calls
+
+Both `IFDHICCPresence()` call sites for this (the `poll_for_targets()`
+EBUSY retry, and the new per-cycle `neard_reclaim_adapter()` yield) run
+with `state_lock` held for the function's entire body — it's locked once
+at entry (`src/ifdnlnfc.c:1678`) and only unlocked at `out`
+(`src/ifdnlnfc.c:1749`). That's worth calling out explicitly because this
+file already has a documented instance of the opposite choice:
+`IFDHPolling()` deliberately drops `state_lock` *before* its own blocking
+`poll()` wait, specifically "so other IFDH* entry points are not stalled by
+it" (comment at `src/ifdnlnfc.c:1152`-`1154`). A synchronous D-Bus round
+trip is the same kind of blocking operation, so the same question applies
+here: hold the lock through it, or drop/reacquire around it the way
+`IFDHPolling()` does?
+
+Decision: **hold it.** Dropping `state_lock` around the D-Bus call would
+mean reacquiring afterward and re-validating everything the lock protects
+(`channel_open`, `adapter_removed`, the netlink sockets) before touching
+them again, since a concurrent `IFDHCloseChannel()` could have torn all of
+that down in the gap — `netlink_cleanup()` frees `event_sock`/`cmd_sock`
+and nothing currently in this file re-checks for that mid-function. Adding
+that re-validation is real new complexity and a new place to get a race
+wrong, in exchange for shrinking a stall that is already bounded and rare:
+
+- `poll_for_targets()` is only on the EBUSY path when `card_present` is
+  false, and `IFDHICCPresence()` short-circuits past all of this
+  (line 1690) whenever `card_present` is true — so these D-Bus calls can
+  never run concurrently with an in-flight `IFDHTransmitToICC()`, which
+  requires a present card and holds `state_lock` for its own duration
+  (`src/ifdnlnfc.c:1602`-`1653`) precisely while one is connected. No
+  FIDO2 transaction can be stalled by this.
+- The only caller that could be kept waiting on `state_lock` by a stuck
+  D-Bus call is something tearing the channel down concurrently —
+  `IFDHCloseChannel()` on reader removal or driver shutdown — and only in
+  the unlikely case that `neard` is hung rather than merely absent (the
+  short per-call timeout from the "Open questions" section below bounds
+  this to roughly that timeout, a few hundred ms, one time, on an
+  already-rare path).
+
+`IFDHPolling()`'s case is different enough that its precedent doesn't
+transfer directly: its wait is multi-second and *not* needed for
+correctness there (nothing in its own body touches protected state across
+the wait), so dropping the lock is free. Here the D-Bus wait is short,
+genuinely frequent (every idle cycle while `neard` holds the adapter), and
+sits in the middle of a call sequence (`poll_for_targets()` → retry →
+`nl_recvmsgs_default()` → yield) that does want a consistent view of
+adapter/channel state throughout. Keep it simple and correct; the
+best-effort framing already in this plan (ignore any D-Bus failure, never
+a hard dependency) is what makes the bounded stall acceptable rather than
+something that needs engineering around.
 
 ### NixOS-side prerequisite: neard's bus policy denies pcscd by default
 
