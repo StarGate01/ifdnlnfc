@@ -209,6 +209,49 @@ immediately. The yield point below is about what `IFDHICCPresence()` does
   the active-target exclusivity from the "Why" section above, which is
   correct to leave alone.
 
+### Caught live: never yield a session in the same call that started it
+
+Implementing and deploying this surfaced a real failure mode the design
+above didn't anticipate. The first version stopped *any* poll session
+found active at the point `IFDHICCPresence()` falls through to
+`IFD_ICC_NOT_PRESENT` — including one that `poll_for_targets()` had just
+started a few lines earlier in that *same* call, when `poll_active` was
+false on entry. That session never survives to see an `IFDHPolling()`
+wait at all: `poll_for_targets()` starts it, the immediately-following
+`nl_recvmsgs_default(event_sock)` drains nothing (no time has passed,
+`event_sock` is non-blocking), and the fix's own yield logic stops it
+again on the spot — a START_POLL followed by a STOP_POLL within the same
+function call, microseconds apart.
+
+Reproduced live against this hardware (NXP1001/npc300): starting and then
+immediately stopping a poll this way reliably left the adapter wedged —
+every subsequent `NFC_CMD_START_POLL`, from *either* `ifdnlnfc` or `neard`,
+came back `-EBUSY`, and neither side's own `Polling` state agreed with
+being the owner (`neard`'s `StopPollLoop` replied "Not polling" while its
+`StartPollLoop` simultaneously got "-EBUSY" from the kernel). This matches
+the independent `target_active_prot` exclusivity from the "Why" section,
+not the polling-lock one this fix targets: something apparently begins
+activating against a poll within single-digit milliseconds of it
+starting, and yanking the poll via `STOP_POLL` before that handshake
+finishes leaves the chip/driver's target state torn and stuck — recoverable
+only by a full reboot, *not* by `nlnfc-init --reset`'s raw NCI power-cycle,
+which doesn't touch the generic `nfc` core's software-side
+`target_active_prot`/`dev->polling` bookkeeping at all. Confirmed the
+inverse too: starting a poll via `neard`'s `StartPollLoop` and leaving it
+running for a couple of real seconds before `StopPollLoop` works cleanly,
+every time, no wedge.
+
+Fix: `IFDHICCPresence()` snapshots `poll_active` *before* conditionally
+calling `poll_for_targets()`, and only runs the stop-and-yield block when
+that snapshot was already true — i.e. only for a session that has already
+lived through one full `IFDHPolling()` wait with nothing found. A session
+started fresh in the current call is left alone and gets to survive into
+that wait instead of being yanked back immediately. This preserves the
+original intent (don't hold a session open indefinitely across *multiple*
+idle cycles) while guaranteeing every session gets at least one real wait
+interval — on the order of the few-hundred-ms-to-~1s `IFDHPolling` cadence
+from the "Why" section — before `ifdnlnfc` ever asks to stop it.
+
 ## How
 
 ### New dependency

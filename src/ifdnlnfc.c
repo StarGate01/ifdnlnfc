@@ -1819,7 +1819,20 @@ IFDHICCPresence(DWORD Lun)
 		}
 	}
 
-	if (!ifdnlnfc_state.adapter.poll_active)
+	/* Snapshot before possibly starting a poll below: only a session
+	 * that was already active on entry has lived through a full
+	 * IFDHPolling() wait with nothing found. One started fresh in this
+	 * very call hasn't been given any time at all yet -- stopping it
+	 * again a few lines down, before the chip has even begun a
+	 * discovery round, is what was wedging the adapter's NCI target
+	 * state (reproduced live: starting and stopping a poll within
+	 * milliseconds of each other leaves it stuck EBUSY for everyone,
+	 * recoverable only by a reboot; the same start left to run for a
+	 * couple of real seconds before stopping works cleanly every time).
+	 * See NEARD-COEXISTENCE.md. */
+	int was_already_polling = ifdnlnfc_state.adapter.poll_active;
+
+	if (!was_already_polling)
 		poll_for_targets(&ifdnlnfc_state.adapter);
 
 	err = nl_recvmsgs_default(event_sock);
@@ -1836,10 +1849,16 @@ IFDHICCPresence(DWORD Lun)
 	}
 
 	/* This idle cycle came up empty: release the poll session instead of
-	 * leaving it held until the next call, so neard gets a real window
-	 * to poll between now and then. See NEARD-COEXISTENCE.md. */
-	stop_poll_for_targets(&ifdnlnfc_state.adapter);
-	neard_reclaim_adapter(ifdnlnfc_state.adapter.idx);
+	 * leaving it held across another full wait, so neard gets a real
+	 * window to poll between now and the next call. Only do this for a
+	 * session that already lived through one full IFDHPolling() wait
+	 * (see snapshot above) -- one just started a few lines up hasn't
+	 * been given any chance yet and gets to survive into that wait
+	 * instead of being yanked back immediately. */
+	if (was_already_polling) {
+		stop_poll_for_targets(&ifdnlnfc_state.adapter);
+		neard_reclaim_adapter(ifdnlnfc_state.adapter.idx);
+	}
 
 	result = IFD_ICC_NOT_PRESENT;
 
