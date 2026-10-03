@@ -39,6 +39,11 @@ static int nfc_family_id;
 struct nfc_adapter {
 	uint32_t idx;
 	int poll_active;
+	/* CLOCK_MONOTONIC timestamp (ms) of the last successful transition
+	 * to poll_active=1, regardless of which caller triggered it. See
+	 * NEARD-COEXISTENCE.md: stopping a session before it has had any
+	 * real dwell time wedges this hardware's NCI target state. */
+	uint64_t poll_started_at_ms;
 	uint8_t initial_power;
 	uint8_t initial_mode;
 	uint32_t protocols;

@@ -46,6 +46,7 @@
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Platform/vendor initialization (e.g. the NXP NPC300 proprietary
@@ -57,6 +58,28 @@
 /* While the PC/SC client has logically powered the card down, re-probe its
  * presence at least this often so removal is still noticed promptly. */
 #define PRESENCE_PROBE_INTERVAL_MS 1000
+
+/* Minimum real time a poll session must have run before IFDHICCPresence()
+ * will consider stopping it again for the neard handoff below. Confirmed
+ * live on this hardware (NXP1001/npc300) that stopping a session within
+ * milliseconds of starting it -- whether started and re-checked within
+ * the same IFDHICCPresence() call, or started moments earlier by
+ * initialize_adapter() at channel-open and torn down by the very first
+ * polling-thread cycle after -- reliably wedges the adapter's NCI target
+ * state: every subsequent START_POLL, from either ifdnlnfc or neard,
+ * then comes back -EBUSY, recoverable only by a reboot (nlnfc-init
+ * --reset does not touch this kernel-side software state). Leaving a
+ * freshly-started session running for a couple of real seconds before
+ * stopping it never reproduced the wedge. See NEARD-COEXISTENCE.md. */
+#define MIN_POLL_DWELL_MS 500
+
+static uint64_t monotonic_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
 
 static struct nl_sock *cmd_sock, *event_sock;
 static int nfc_family_id;
@@ -786,6 +809,7 @@ static int poll_for_targets(struct nfc_adapter * adapter)
 	else {
 		Log2(PCSC_LOG_DEBUG, "NFC target poll started. Adapter index:%d.", adapter->idx);
 		adapter->poll_active = 1;
+		adapter->poll_started_at_ms = monotonic_ms();
 	}
 
 nla_put_failure:
@@ -1819,20 +1843,7 @@ IFDHICCPresence(DWORD Lun)
 		}
 	}
 
-	/* Snapshot before possibly starting a poll below: only a session
-	 * that was already active on entry has lived through a full
-	 * IFDHPolling() wait with nothing found. One started fresh in this
-	 * very call hasn't been given any time at all yet -- stopping it
-	 * again a few lines down, before the chip has even begun a
-	 * discovery round, is what was wedging the adapter's NCI target
-	 * state (reproduced live: starting and stopping a poll within
-	 * milliseconds of each other leaves it stuck EBUSY for everyone,
-	 * recoverable only by a reboot; the same start left to run for a
-	 * couple of real seconds before stopping works cleanly every time).
-	 * See NEARD-COEXISTENCE.md. */
-	int was_already_polling = ifdnlnfc_state.adapter.poll_active;
-
-	if (!was_already_polling)
+	if (!ifdnlnfc_state.adapter.poll_active)
 		poll_for_targets(&ifdnlnfc_state.adapter);
 
 	err = nl_recvmsgs_default(event_sock);
@@ -1850,12 +1861,18 @@ IFDHICCPresence(DWORD Lun)
 
 	/* This idle cycle came up empty: release the poll session instead of
 	 * leaving it held across another full wait, so neard gets a real
-	 * window to poll between now and the next call. Only do this for a
-	 * session that already lived through one full IFDHPolling() wait
-	 * (see snapshot above) -- one just started a few lines up hasn't
-	 * been given any chance yet and gets to survive into that wait
-	 * instead of being yanked back immediately. */
-	if (was_already_polling) {
+	 * window to poll between now and the next call. Only do this once
+	 * the session has run for a minimum real dwell time (MIN_POLL_DWELL_MS)
+	 * -- not merely "was already active on entry", which is also true
+	 * for a session initialize_adapter() just started at channel-open a
+	 * few milliseconds before this very first polling-thread cycle runs.
+	 * Either case (started and reconsidered within this same call, or
+	 * started moments ago by a different caller) stops it before the
+	 * chip has had any real chance to run a discovery round, which is
+	 * what wedges the adapter's NCI target state. See
+	 * NEARD-COEXISTENCE.md. */
+	if (ifdnlnfc_state.adapter.poll_active &&
+			monotonic_ms() - ifdnlnfc_state.adapter.poll_started_at_ms >= MIN_POLL_DWELL_MS) {
 		stop_poll_for_targets(&ifdnlnfc_state.adapter);
 		neard_reclaim_adapter(ifdnlnfc_state.adapter.idx);
 	}

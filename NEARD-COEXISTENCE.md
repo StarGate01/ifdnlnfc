@@ -241,16 +241,42 @@ inverse too: starting a poll via `neard`'s `StartPollLoop` and leaving it
 running for a couple of real seconds before `StopPollLoop` works cleanly,
 every time, no wedge.
 
-Fix: `IFDHICCPresence()` snapshots `poll_active` *before* conditionally
-calling `poll_for_targets()`, and only runs the stop-and-yield block when
-that snapshot was already true — i.e. only for a session that has already
-lived through one full `IFDHPolling()` wait with nothing found. A session
-started fresh in the current call is left alone and gets to survive into
-that wait instead of being yanked back immediately. This preserves the
-original intent (don't hold a session open indefinitely across *multiple*
-idle cycles) while guaranteeing every session gets at least one real wait
-interval — on the order of the few-hundred-ms-to-~1s `IFDHPolling` cadence
-from the "Why" section — before `ifdnlnfc` ever asks to stop it.
+First attempt: snapshot `poll_active` *before* conditionally calling
+`poll_for_targets()`, and only run the stop-and-yield block when that
+snapshot was already true. Deployed, and still wedged — because a second
+instance of the exact same hazard hides behind an entry that reads
+`poll_active == true` for a reason that has nothing to do with having
+survived a wait: `initialize_adapter()` (`src/ifdnlnfc.c:988`, at
+channel-open) starts a session itself, `open_channel()` succeeds, and the
+very *first* `IFDHICCPresence()` call pcscd's polling thread makes
+afterward — typically within single-digit milliseconds, before
+`IFDHPolling()` has ever run a wait against this session — sees
+`poll_active == true` on entry (true, but only because channel-open just
+set it moments ago) and stops it anyway. Confirmed live, with debug
+logging: `poll_for_targets() NFC target poll started` immediately followed
+(~10ms later) by `stop_poll_for_targets_ex() NFC target poll stopped`, and
+the adapter wedged exactly as before. A boolean snapshot of "was it
+already active" can't distinguish "active because it survived a wait"
+from "active because someone just started it a moment ago" — both read
+`true`.
+
+Actual fix: track real elapsed time, not a boolean. `struct nfc_adapter`
+gained `poll_started_at_ms`, a `CLOCK_MONOTONIC` timestamp
+(`src/ifdnlnfc.h`) written by `poll_for_targets()` itself
+(`src/ifdnlnfc.c:811`, right alongside the existing `poll_active = 1`) —
+the one place that transitions a session to active, regardless of which
+caller triggered it. `IFDHICCPresence()`'s stop-and-yield block now checks
+`poll_active && monotonic_ms() - poll_started_at_ms >= MIN_POLL_DWELL_MS`
+(`MIN_POLL_DWELL_MS` = 500ms) instead of a snapshot. This covers both
+instances of the hazard uniformly — started-and-reconsidered within the
+same call, and started-by-channel-open-stopped-by-the-first-cycle-after —
+with the same mechanism, while still guaranteeing every session gets a
+real dwell window before `ifdnlnfc` ever asks to stop it. 500ms was picked
+empirically: live testing via `neard`'s own D-Bus `StartPollLoop` showed a
+session surviving on the order of a couple of real seconds never
+reproduced the wedge, so 500ms leaves comfortable margin while still
+handing the adapter back to `neard` promptly during genuine idle
+contention.
 
 ## How
 
