@@ -92,6 +92,31 @@ tap the user is actively waiting on should win over `neard`'s background
 all, so the outcome is whichever daemon's netlink call lands first — with
 `ConstantPoll` on, that's `neard`, almost always, which is backwards.
 
+This is only about *idle* contention, though — periods where neither side
+has an actual target. While a card is genuinely connected (mid-transaction,
+or just sitting "present" — `IFDHICCPresence()` short-circuits to
+`IFD_SUCCESS` without re-polling once `ifdnlnfc_state.card_present` is set,
+so "present" can span the whole time a key sits on the reader, not just one
+APDU exchange), the kernel's NCI layer enforces a *second*, independent
+exclusivity check beyond the polling lock:
+
+```c
+// net/nfc/nci/core.c, nci_start_poll()
+if (ndev->target_active_prot) {
+    pr_err("there is an active target\n");
+    return -EBUSY;
+}
+```
+
+That's a physical constraint, not a software policy — one antenna, one RF
+conversation at a time — and there's no D-Bus trick that fixes it, nor
+should there be: interrupting an in-progress smartcard transaction so
+`neard` can poll would be wrong. `neard` stays locked out for as long as a
+card is actually connected, full stop. The fix below only ever helps during
+genuinely idle stretches (no card connected to `ifdnlnfc` at all), by making
+sure `ifdnlnfc` doesn't sit on an *unused* poll session between pcscd's
+polling-thread cycles.
+
 ## What
 
 Don't try to fight for the kernel lock — there's no preemption primitive to
@@ -113,18 +138,64 @@ Concretely:
    be a best-effort nudge, never a hard dependency. `ifdnlnfc`/pcscd must
    keep working exactly as today when `neard` isn't installed or enabled.
 2. Retry `poll_for_targets()` once after that.
-3. When `stop_poll_for_targets_ex()` (`src/ifdnlnfc.c:705`) actually stops
-   our own poll/transaction (i.e. the existing teardown path, called from
-   line 1086 and the reset path at line 977), make a second D-Bus call to
-   `StartPollLoop()` on the same adapter object, handing the adapter back
-   to `neard` for NDEF-tag duty. Again best-effort, ignore failures.
+3. Hand the adapter back at the end of every idle `IFDHICCPresence()` cycle
+   that didn't find anything — **not** only at channel close. See below for
+   why the obvious-looking "yield at teardown" point is actually wrong.
 
-This gives the right priority for free: `ifdnlnfc` actively preempts
-`neard` exactly when it has real work to do, and hands the adapter back the
-moment it's done. `neard`'s own `ConstantPoll` retry logic
-(`src/adapter.c`, the 1-second `dep_timer` retry on `-EBUSY`) means it
-recovers on its own without needing to be told anything beyond the
-`StartPollLoop` nudge.
+`neard`'s own `ConstantPoll` retry logic (`src/adapter.c`, the 1-second
+`dep_timer` retry on `-EBUSY`) means it recovers on its own without needing
+anything beyond that per-cycle `StartPollLoop` nudge.
+
+### Why "yield at `IFDHCloseChannel`" doesn't work
+
+The first pass at this plan called `StartPollLoop()` wherever
+`stop_poll_for_targets_ex()` (`src/ifdnlnfc.c:705`) does a *real* stop —
+which turns out to be only two places: `initialize_adapter()`'s
+best-effort cleanup at line 977 (immediately followed by a fresh
+`poll_for_targets()` at line 988 — rightly excluded, no yield needed there)
+and `IFDHCloseChannel()` at line 1086. The second one is the bug: for a
+long-running system service, pcscd opens the IFD channel once when the
+reader appears and keeps it open for the reader's entire lifetime —
+`IFDHCloseChannel` only fires on driver shutdown or reader removal, not
+between taps or transactions.
+
+Meanwhile `poll_active` also gets cleared directly — without going through
+`stop_poll_for_targets_ex` at all, and without any yield — at
+`src/ifdnlnfc.c:501`, inside the `NFC_EVENT_TARGETS_FOUND` handler. And
+`IFDHICCPresence()` (`src/ifdnlnfc.c:1731`) re-arms its own poll on every
+subsequent call whenever `!poll_active`. Net effect: once `ifdnlnfc` wins
+the lock the first time, it just keeps re-polling itself forever, every
+cycle, for as long as pcscd runs — `neard` would be starved *permanently*
+after the first FIDO2 tap, not just momentarily. Worse, since `ifdnlnfc`
+polls the same `NFC_PROTO_ISO14443_MASK`/`_B_MASK` that many NDEF Type-4
+tags also use, it would end up silently swallowing taps meant for the KDE
+integration too, with no way back short of restarting pcscd.
+
+### The actual fix: yield at the end of every idle cycle
+
+`IFDHICCPresence()` needs to stop treating "I already have a poll session
+open" as a steady state to leave alone, and instead release it every time
+a cycle comes up empty:
+
+- When a poll cycle's wait (the existing `nl_recvmsgs_default(event_sock)`
+  call and the `timeout` handling around `src/ifdnlnfc.c:1136`) ends without
+  a target having been found this cycle, explicitly
+  `stop_poll_for_targets(&ifdnlnfc_state.adapter)` and then
+  `neard_reclaim_adapter(adapter->idx)` **before returning** from
+  `IFDHICCPresence()`, rather than leaving `poll_active` set for the next
+  call to silently skip re-polling.
+- The next `IFDHICCPresence()` call then starts from a clean slate: no
+  poll session held, so it goes through the normal
+  `poll_for_targets()` → (possibly) `-EBUSY` → `neard_yield_adapter()` →
+  retry path again.
+- This turns the idle state into a real time-share: between any two
+  `IFDHICCPresence()` calls (pcscd's own polling-thread cadence — observed
+  on the order of a few hundred ms to ~1s), `neard` gets a window where the
+  adapter is actually free, instead of a session `ifdnlnfc` holds open
+  indefinitely just in case.
+- Once a target *is* found and connected, none of this applies — that's
+  the active-target exclusivity from the "Why" section above, which is
+  correct to leave alone.
 
 ## How
 
@@ -172,15 +243,60 @@ starts.
 - In `poll_for_targets()` (`src/ifdnlnfc.c:662`): on `err == -EBUSY` from
   `nl_send_msg()`, call `neard_yield_adapter(adapter->idx)` and retry the
   `nl_send_msg()` once before giving up and returning the error as today.
-- In `stop_poll_for_targets_ex()` (`src/ifdnlnfc.c:705`), after a
-  successful stop (the `else` branch at the end that sets
-  `adapter->poll_active = 0`), call `neard_reclaim_adapter(adapter->idx)`.
-  Only do this for the *real* stop (teardown/transaction-complete path),
-  not for the `force` path used when resetting after a bad state
-  (`src/ifdnlnfc.c:977`) where the adapter is about to be re-polled by
-  `ifdnlnfc` itself immediately after (`src/ifdnlnfc.c:988`) — handing back
-  control there would just cause an immediate, pointless second contention
-  cycle.
+- In `IFDHICCPresence()` (`src/ifdnlnfc.c:1669`), at the point where the
+  current cycle's wait has ended (`nl_recvmsgs_default`/`timeout` handling
+  around line 1136) without a target found: call
+  `stop_poll_for_targets(&ifdnlnfc_state.adapter)` followed by
+  `neard_reclaim_adapter(adapter->idx)` before returning — this is the new
+  per-cycle yield point, replacing the channel-close-only one from the
+  first pass of this plan (see "Why yield at `IFDHCloseChannel` doesn't
+  work" above).
+- `stop_poll_for_targets_ex()`'s existing call sites
+  (`src/ifdnlnfc.c:977` and `:1086`) are unaffected — `977`'s force-reset
+  path still shouldn't yield (immediately re-polls itself at line 988), and
+  `1086`'s `IFDHCloseChannel` path can keep calling the plain
+  `stop_poll_for_targets()` wrapper as today; a `neard_reclaim_adapter()`
+  call there too is harmless (best-effort, idempotent) but no longer the
+  *only* place it happens.
+
+### NixOS-side prerequisite: neard's bus policy denies pcscd by default
+
+Even with all of the above implemented correctly, the D-Bus calls would be
+rejected before ever reaching `neard`. `neard`'s own shipped
+`org.neard.conf` bus policy is:
+
+```xml
+<policy user="root">
+    <allow send_destination="org.neard"/>
+    ...
+</policy>
+<policy at_console="true">
+    <allow send_destination="org.neard"/>
+</policy>
+<policy context="default">
+    <deny send_destination="org.neard"/>
+</policy>
+```
+
+`pcscd` runs as its own dedicated unprivileged user, not root — confirmed
+live (`ps`/`systemctl show` on the actual running service: `User=pcscd`,
+non-root UID) — and a system service isn't "at console" either. So without
+a policy change, every single call from `ifdnlnfc` would be denied by the
+bus itself, independent of anything `ifdnlnfc` does right. This needs its
+own `<policy user="pcscd"><allow send_destination="org.neard"/></policy>`
+snippet shipped via `services.dbus.packages` on the NixOS side (already
+added in the nix-config repo's `overlay/modules/nfc-nlnci.nix`, alongside
+the module that wires `ifdnlnfc` into `pcscd` in the first place) — nothing
+further needed here in `ifdnlnfc` itself, just noting it so the two sides
+of this fix aren't separated without a trace of why both are needed.
+
+Checked `systemd.services.pcscd.serviceConfig`'s other sandboxing
+(`ProtectSystem=strict`, `RestrictNamespaces=yes`, `SystemCallFilter=
+@system-service` minus `@resources @privileged`, no `RestrictAddressFamilies`
+set at all) and none of it blocks an `AF_UNIX` D-Bus client connection —
+`ProtectSystem=strict` only blocks *writes* outside allowlisted paths, not
+`connect()` to an existing socket. The bus policy above is the only actual
+blocker.
 
 ### What this deliberately does not do
 
